@@ -1,0 +1,5 @@
+/tmm_env/
+/data/
+/checkpoints/
+*.txt
+__pycache__
