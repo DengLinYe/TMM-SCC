@@ -3,3 +3,5 @@
 /checkpoints/
 *.txt
 __pycache__
+/output/
+baseline_results.json

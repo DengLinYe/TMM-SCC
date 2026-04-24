@@ -17,7 +17,7 @@ from tqdm import tqdm
 from transformers import BertForMaskedLM
 
 import utils
-from attack import *
+from attack import MultiModalAttacker, TextAttacker
 from dataset import pair_dataset_attack
 from models.model_retrieval import ALBEF
 from models.tokenization_bert import BertTokenizer
@@ -91,7 +91,14 @@ class Evaluation:
         text_atts = torch.zeros(num_text, 30).long()
         adv_example = []
         print("Forward")
-        for images, texts, texts_ids, _ in tqdm(self.data_loader, ascii=True):
+        for step, (images, texts, texts_ids, _) in enumerate(
+            tqdm(self.data_loader, ascii=True)
+        ):
+            if step >= 10:
+                print("\n>>> 快速验证：已完成 10 个 Batch，提前结束攻击循环 <<<")
+                torch.cuda.empty_cache()
+                break
+
             images = images.to(self.device)
             if args.adv != 0:
                 images, texts = multi_attacker.run_transfer_attack(
@@ -115,11 +122,12 @@ class Evaluation:
                 text_embeds[texts_ids] = output["text_embed"].cpu().detach()
                 text_atts[texts_ids] = texts_input.attention_mask.cpu().detach()
 
+            torch.cuda.empty_cache()
+
         with open(args.save_json_name, "w", encoding="utf8") as f:
             json.dump(adv_example, f, ensure_ascii=False, indent=2)
 
         score_matrix_i2t, score_matrix_t2i = self.retrieval_score(
-            self.model,
             image_feats,
             image_embeds,
             text_feats,
@@ -127,7 +135,6 @@ class Evaluation:
             text_atts,
             num_image,
             num_text,
-            device=self.device,
         )
 
         total_time = time.time() - start_time
@@ -146,8 +153,9 @@ class Evaluation:
         num_image,
         num_text,
     ):
-        if self.device is None:
-            self.device = image_embeds.device
+        self.device = next(self.model.parameters()).device
+
+        # self.config["k_test"] = 16  # 128
 
         metric_logger = utils.MetricLogger(delimiter="  ")
         header = "Evaluation Direction Similarity With Bert Attack:"
@@ -155,52 +163,90 @@ class Evaluation:
         sims_matrix = image_feats @ text_feats.t()
         score_matrix_i2t = torch.full((num_image, num_text), -100.0).to(self.device)
 
-        for i, sims in enumerate(metric_logger.log_every(sims_matrix, 50, header)):
-            topk_sim, topk_idx = sims.topk(k=config["k_test"], dim=0)
+        with torch.no_grad():
+            for i, sims in enumerate(metric_logger.log_every(sims_matrix, 50, header)):
+                topk_sim, topk_idx = sims.topk(k=config["k_test"], dim=0)
 
-            encoder_output = (
-                image_embeds[i].repeat(config["k_test"], 1, 1).to(self.device)
-            )
-            encoder_att = torch.ones(encoder_output.size()[:-1], dtype=torch.long).to(
-                self.device
-            )
-            output = self.model.text_encoder(
-                encoder_embeds=text_embeds[topk_idx].to(self.device),
-                attention_mask=text_atts[topk_idx].to(self.device),
-                encoder_hidden_states=encoder_output,
-                encoder_attention_mask=encoder_att,
-                return_dict=True,
-                mode="fusion",
-            )
-            score = self.model.itm_head(output.last_hidden_state[:, 0, :])[:, 1]
-            score_matrix_i2t[i, topk_idx] = score
+                encoder_output = (
+                    image_embeds[i].repeat(config["k_test"], 1, 1).to(self.device)
+                )
+                encoder_att = torch.ones(
+                    encoder_output.size()[:-1], dtype=torch.long
+                ).to(self.device)
+                output = self.model.text_encoder(
+                    encoder_embeds=text_embeds[topk_idx].to(self.device),
+                    attention_mask=text_atts[topk_idx].to(self.device),
+                    encoder_hidden_states=encoder_output,
+                    encoder_attention_mask=encoder_att,
+                    return_dict=True,
+                    mode="fusion",
+                )
+                score = self.model.itm_head(output.last_hidden_state[:, 0, :])[:, 1]
+                score_matrix_i2t[i, topk_idx] = score
 
-        sims_matrix = sims_matrix.t()
-        score_matrix_t2i = torch.full((num_text, num_image), -100.0).to(self.device)
+            sims_matrix = sims_matrix.t()
+            score_matrix_t2i = torch.full((num_text, num_image), -100.0).to(self.device)
 
-        for i, sims in enumerate(metric_logger.log_every(sims_matrix, 50, header)):
-            topk_sim, topk_idx = sims.topk(k=config["k_test"], dim=0)
-            encoder_output = image_embeds[topk_idx].to(self.device)
-            encoder_att = torch.ones(encoder_output.size()[:-1], dtype=torch.long).to(
-                self.device
-            )
-            output = self.model.text_encoder(
-                encoder_embeds=text_embeds[i]
-                .repeat(config["k_test"], 1, 1)
-                .to(self.device),
-                attention_mask=text_atts[i].repeat(config["k_test"], 1).to(self.device),
-                encoder_hidden_states=encoder_output,
-                encoder_attention_mask=encoder_att,
-                return_dict=True,
-                mode="fusion",
-            )
-            score = self.model.itm_head(output.last_hidden_state[:, 0, :])[:, 1]
-            score_matrix_t2i[i, topk_idx] = score
+            for i, sims in enumerate(metric_logger.log_every(sims_matrix, 50, header)):
+                topk_sim, topk_idx = sims.topk(k=config["k_test"], dim=0)
+                encoder_output = image_embeds[topk_idx].to(self.device)
+                encoder_att = torch.ones(
+                    encoder_output.size()[:-1], dtype=torch.long
+                ).to(self.device)
+                output = self.model.text_encoder(
+                    encoder_embeds=text_embeds[i]
+                    .repeat(config["k_test"], 1, 1)
+                    .to(self.device),
+                    attention_mask=text_atts[i]
+                    .repeat(config["k_test"], 1)
+                    .to(self.device),
+                    encoder_hidden_states=encoder_output,
+                    encoder_attention_mask=encoder_att,
+                    return_dict=True,
+                    mode="fusion",
+                )
+                score = self.model.itm_head(output.last_hidden_state[:, 0, :])[:, 1]
+                score_matrix_t2i[i, topk_idx] = score
 
         return score_matrix_i2t, score_matrix_t2i
 
+    def itm_eval(self, scores_i2t, scores_t2i, img2txt, txt2img):
+        ranks = np.zeros(scores_i2t.shape[0])
+        for index, score in enumerate(scores_i2t):
+            inds = np.argsort(score)[::-1]
+            ranks[index] = np.where(inds == img2txt[index][0])[0][0]
+        tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+        tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+        tr10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+        ranks = np.zeros(scores_t2i.shape[0])
+        for index, score in enumerate(scores_t2i):
+            inds = np.argsort(score)[::-1]
+            ranks[index] = np.where(inds == txt2img[index])[0][0]
+        ir1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+        ir5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+        ir10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+        tr_mean = (tr1 + tr5 + tr10) / 3
+        ir_mean = (ir1 + ir5 + ir10) / 3
+        r_mean = (tr_mean + ir_mean) / 2
+
+        eval_result = {
+            "txt_r1": tr1,
+            "txt_r5": tr5,
+            "txt_r10": tr10,
+            "img_r1": ir1,
+            "img_r5": ir5,
+            "img_r10": ir10,
+            "txt_r_mean": tr_mean,
+            "img_r_mean": ir_mean,
+            "r_mean": r_mean,
+        }
+        return eval_result
+
 
 def main(args, config):
+    print("starting...")
     device = args.gpu[0]
 
     seed = args.seed + utils.get_rank()
@@ -209,7 +255,6 @@ def main(args, config):
     random.seed(seed)
     cudnn.benchmark = True
 
-    #### Dataset ####
     print("Creating dataset")
     test_transform = transforms.Compose(
         [
@@ -224,7 +269,7 @@ def main(args, config):
     )
 
     test_loader = DataLoader(
-        test_dataset, batch_size=config["batch_size_test"], num_workers=12
+        test_dataset, batch_size=config["batch_size_test"], num_workers=0
     )
 
     tokenizer = BertTokenizer.from_pretrained(args.text_encoder)
@@ -250,24 +295,22 @@ def main(args, config):
         **{f"test_{k}": v for k, v in result.items()},
         "eval type": args.adv,
         "cls": args.cls,
-        "eps": config["epsilon"],
-        "iters": config["num_iters"],
-        "alpha": args.alpha,
-        "intervals": args.intervals,
-        "num_steps": args.num_steps,
-        "kernel_size": args.kernel_size,
-        "momentum": args.momentum,
-        "mode": args.mode,
-        "epsilon": args.epsilon,
+        "eps": config.get("epsilon", 12),
+        "iters": config.get("num_iters", 10),
+        "alpha": config.get("alpha", 0.4),
+        "intervals": getattr(args, "intervals", 5),
+        "num_steps": getattr(args, "num_steps", 10),
+        "kernel_size": getattr(args, "kernel_size", 5),
+        "momentum": getattr(args, "momentum", 1.0),
+        "mode": getattr(args, "mode", "nearest"),
     }
     print(log_stats)
     with open(os.path.join(args.output_dir, args.log_name), "a+") as f:
         f.write(json.dumps(log_stats) + "\n")
 
-    torch.cuda.empty_cache()
-
 
 if __name__ == "__main__":
+    print(1)
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="flickr")
     parser.add_argument("--config", default="./configs/Retrieval_flickr.yaml")

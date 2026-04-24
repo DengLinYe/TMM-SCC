@@ -1,13 +1,14 @@
+# dataset\caption_dataset.py
 import json
 import os
 
 from PIL import Image, ImageFile
 from torch.utils.data import Dataset
 
+from dataset.utils import pre_caption
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
-
-from dataset.utils import pre_caption
 
 
 class pair_dataset_attack(Dataset):
