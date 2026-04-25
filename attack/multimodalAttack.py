@@ -138,9 +138,13 @@ class MultiModalAttacker:
             )
 
             vl_embeddings = output.last_hidden_state[:, 0, :]
-            vl_output = self.net.itm_head(vl_embeddings)
 
-            loss_pre = vl_output[:, 1].sum()
+            if hasattr(self.net, "itm_head"):
+                vl_output = self.net.itm_head(vl_embeddings)
+                loss_pre = vl_output[:, 1].sum()
+            else:
+                vl_output = self.net.cls_head(vl_embeddings)
+                loss_pre = vl_output.max(dim=1)[0].sum()
 
             self.net.zero_grad()
             loss_pre.backward()
@@ -197,77 +201,21 @@ class MultiModalAttacker:
             gradcam_final = gradcam_final.detach().cpu().numpy()
             gradcam_final = gradcam_final.transpose(2, 0, 1)
 
-        attMap = np.add.reduceat(gradcam_final, [0, indices[0]])[::2]
-        attMap = (attMap / 5).squeeze()
-        attMap = torch.repeat_interleave(
-            torch.tensor(attMap).unsqueeze(0).unsqueeze(0), repeats=3, dim=1
-        )
+        if args.dataset == "snli-ve":
+            attMap = (
+                torch.from_numpy(gradcam_final)
+                .unsqueeze(1)
+                .repeat(1, 3, 1, 1)
+                .to(device)
+            )
+        else:
+            attMap = np.add.reduceat(gradcam_final, [0, indices[0]])[::2]
+            attMap = (attMap / 5).squeeze()
+            attMap = torch.repeat_interleave(
+                torch.tensor(attMap).unsqueeze(0).unsqueeze(0), repeats=3, dim=1
+            )
 
         return attMap
-
-    # def getAtt(self, attImage, text_input, device, indices, args):
-
-    #     image_embeds = self.net.visual_encoder(images_normalize(attImage))
-    #     image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
-    #     output = self.net.text_encoder(
-    #         text_input.input_ids,
-    #         attention_mask=text_input.attention_mask,
-    #         encoder_hidden_states=image_embeds,
-    #         encoder_attention_mask=image_atts,
-    #         return_dict=True,
-    #     )
-    #     vl_embeddings = output.last_hidden_state[:, 0, :]
-    #     vl_output = self.net.itm_head(vl_embeddings)
-    #     loss_pre = vl_output[:, 1].sum()
-    #     self.net.zero_grad()
-    #     loss_pre.backward()
-
-    #     with torch.no_grad():
-    #         cam = []
-    #         mask_att = text_input.attention_mask.view(
-    #             text_input.attention_mask.size(0), 1, -1, 1, 1
-    #         )
-    #         for blk in range(
-    #             6, len(self.net.text_encoder.base_model.base_model.encoder.layer)
-    #         ):
-    #             grads = (
-    #                 self.net.text_encoder.base_model.base_model.encoder.layer[blk]
-    #                 .crossattention.self.get_attn_gradients()
-    #                 .detach()
-    #             )
-    #             cams = (
-    #                 self.net.text_encoder.base_model.base_model.encoder.layer[blk]
-    #                 .crossattention.self.get_attention_map()
-    #                 .detach()
-    #             )
-    #             cams = (
-    #                 cams[:, :, :, 1:].reshape(attImage.size(0), 12, -1, 24, 24)
-    #                 * mask_att
-    #             )
-    #             grads = (
-    #                 grads[:, :, :, 1:]
-    #                 .clamp(min=0)
-    #                 .reshape(attImage.size(0), 12, -1, 24, 24)
-    #                 * mask_att
-    #             )
-    #             gradcam = cams * grads
-    #             gradcam = gradcam.mean(1).mean(1)
-    #             cam.append(gradcam)
-    #         gradcam = 0
-    #         for i in range(len(cam)):
-    #             gradcam += cam[i]
-    #         gradcam = gradcam / attImage.size(0)
-    #         gradcam = gradcam.permute(1, 2, 0)
-    #         gradcam = self.getGradCam(gradcam, attImage[0].shape[1:3])
-    #         gradcam = gradcam.transpose(2, 0, 1)
-
-    #     attMap = np.add.reduceat(gradcam, [0, indices[0]])[::2]
-    #     attMap = (attMap / 5).squeeze()
-    #     attMap = torch.repeat_interleave(
-    #         torch.tensor(attMap).unsqueeze(0).unsqueeze(0), repeats=3, dim=1
-    #     )
-
-    #     return attMap
 
     def run_transfer_attack(self, images, text, args, num_iters, k=10, max_length=30):
         device = images.device
@@ -281,26 +229,36 @@ class MultiModalAttacker:
         ) = self.get_origin_and_adv_embeds(images, text, device, max_length, k)
         loss_fn = torch.nn.CosineEmbeddingLoss()
 
-        indices = torch.linspace(
-            4, images.shape[0] - 1, int(images.shape[0] / 5), dtype=int
-        ).cpu()
-        attImage = images.index_select(0, indices.to(device))
+        if args.dataset == "snli-ve":
+            indices = torch.arange(images.shape[0]).cpu()
+            attImage = images.to(device)
+        else:
+            indices = torch.linspace(
+                4, images.shape[0] - 1, int(images.shape[0] / 5), dtype=int
+            ).cpu()
+            attImage = images.index_select(0, indices.to(device))
+
         attMap = self.getAtt(attImage, text_input, device, indices, args)
         image_attack = self.image_attacker.attack(attImage, attMap, num_iters)
 
         for i in range(num_iters):
+            if i % 10 == 0:
+                print(f"\r[Attack Process] Step: {i}/{num_iters}", end="", flush=True)
+
             image_diversity = next(image_attack)
-            adv = [
-                image_diversity[i].repeat(5, 1, 1, 1)
-                for i in range(image_diversity.shape[0])
-            ]
-            # 如果列表里有攻击过的图片，就正常拼接
-            if len(adv) > 0:
-                adv = torch.cat(adv, dim=0)
+
+            if args.dataset == "snli-ve":
+                adv = image_diversity
             else:
-                # 如果列表是空的（触发了安全阀被跳过），直接返回原始的图片 Batch
-                # 注意：如果你的代码里获取 DataLoader 原始图片的变量名叫 images（带s），这里就改成 images
-                adv = images
+                adv = [
+                    image_diversity[i].repeat(5, 1, 1, 1)
+                    for i in range(image_diversity.shape[0])
+                ]
+                if len(adv) > 0:
+                    adv = torch.cat(adv, dim=0)
+                else:
+                    adv = images
+
             _, _, _, _, text_adv_input, text_adv = self.get_origin_and_adv_embeds(
                 adv.detach(), text, device, max_length, k
             )
@@ -342,10 +300,13 @@ class MultiModalAttacker:
             torch.cuda.empty_cache()
 
         images_adv = next(image_attack)
-        images_adv = [
-            images_adv[i].repeat(5, 1, 1, 1) for i in range(images_adv.shape[0])
-        ]
-        images_adv = torch.cat(images_adv, dim=0)
+
+        if args.dataset != "snli-ve":
+            images_adv = [
+                images_adv[i].repeat(5, 1, 1, 1) for i in range(images_adv.shape[0])
+            ]
+            images_adv = torch.cat(images_adv, dim=0)
+
         _, _, _, _, _, text_adv = self.get_origin_and_adv_embeds(
             adv, text, device, max_length, k
         )

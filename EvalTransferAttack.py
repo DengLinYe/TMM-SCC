@@ -89,7 +89,12 @@ class Evaluation:
         text_feats = torch.zeros(num_text, config["embed_dim"])
         text_embeds = torch.zeros(num_text, 30, 768)
         text_atts = torch.zeros(num_text, 30).long()
-        adv_example = []
+
+        adv_save_dir = os.path.join(args.save_dir, "adv_samples_retrieval")
+        os.makedirs(adv_save_dir, exist_ok=True)
+        adv_records = []
+        import torchvision
+
         print("Forward")
         for step, (images, texts, texts_ids, _) in enumerate(
             tqdm(self.data_loader, ascii=True)
@@ -103,6 +108,21 @@ class Evaluation:
             if args.adv != 0:
                 images, texts = multi_attacker.run_transfer_attack(
                     images, texts, args, num_iters=config["num_iters"]
+                )
+
+            for i in range(images.size(0)):
+                global_idx = step * config["batch_size_test"] + i
+                img_filename = f"adv_{global_idx}.png"
+                img_path = os.path.join(adv_save_dir, img_filename)
+                torchvision.utils.save_image(images[i], img_path)
+
+                adv_records.append(
+                    {
+                        "image_id": global_idx,
+                        "text_id": texts_ids[i].item(),
+                        "image_path": img_filename,
+                        "adv_text": texts[i],
+                    }
                 )
 
             texts_input = self.tokenizer(
@@ -125,7 +145,7 @@ class Evaluation:
             torch.cuda.empty_cache()
 
         with open(args.save_json_name, "w", encoding="utf8") as f:
-            json.dump(adv_example, f, ensure_ascii=False, indent=2)
+            json.dump(adv_records, f, ensure_ascii=False, indent=2)
 
         score_matrix_i2t, score_matrix_t2i = self.retrieval_score(
             image_feats,

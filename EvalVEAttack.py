@@ -18,7 +18,7 @@ from transformers import BertForMaskedLM
 
 import utils
 from attack import MultiModalAttacker, TextAttacker
-from dataset.caption_dataset_ve import VEDataset
+from dataset.caption_dataset_ve import ve_dataset_attack
 from models.model_ve import ALBEF
 from models.tokenization_bert import BertTokenizer
 
@@ -82,10 +82,21 @@ class EvaluationVE:
         correct = 0
         total = 0
 
+        adv_save_dir = os.path.join(args.save_dir, "adv_samples_ve")
+        os.makedirs(adv_save_dir, exist_ok=True)
+        adv_records = []
+
+        import torchvision
+
         print("Forward VE")
         for step, (images, texts, labels) in enumerate(
             tqdm(self.data_loader, ascii=True)
         ):
+            if step >= 10:
+                print("\n>>> 快速验证：已完成 10 个 Batch，提前结束攻击循环 <<<")
+                torch.cuda.empty_cache()
+                break
+
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -94,15 +105,45 @@ class EvaluationVE:
                     images, texts, args, num_iters=self.config["num_iters"]
                 )
 
+            for i in range(images.size(0)):
+                global_idx = step * self.config["batch_size_test"] + i
+                img_filename = f"adv_{global_idx}.png"
+                img_path = os.path.join(adv_save_dir, img_filename)
+                torchvision.utils.save_image(images[i], img_path)
+
+                adv_records.append(
+                    {
+                        "image_id": global_idx,
+                        "image_path": img_filename,
+                        "adv_text": texts[i],
+                        "label": labels[i].item(),
+                    }
+                )
+
+            texts_input = self.tokenizer(
+                texts,
+                padding="max_length",
+                truncation=True,
+                max_length=30,
+                return_tensors="pt",
+            ).to(self.device)
+
             with torch.no_grad():
                 images = images_normalize(images)
-                prediction = self.model(images, texts, targets=labels, train=False)
+                prediction = self.model(
+                    images, texts_input, targets=labels, train=False
+                )
 
                 _, predicted_class = prediction.max(1)
                 total += labels.size(0)
                 correct += predicted_class.eq(labels).sum().item()
 
             torch.cuda.empty_cache()
+
+        with open(
+            os.path.join(args.save_dir, "ve_adv_manifest.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(adv_records, f, indent=4, ensure_ascii=False)
 
         accuracy = 100.0 * correct / total
         print(f"VE Task Accuracy after Attack: {accuracy:.2f}%")
@@ -134,7 +175,9 @@ def main(args, config):
         ]
     )
 
-    test_dataset = VEDataset(config["test_file"], config["image_root"], test_transform)
+    test_dataset = ve_dataset_attack(
+        config["test_file"], test_transform, config["image_root"]
+    )
 
     test_loader = DataLoader(
         test_dataset, batch_size=config["batch_size_test"], num_workers=0
@@ -203,7 +246,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     yaml_parser = yaml.YAML(typ="safe")
-    config = yaml_parser.load(open(args.config, "r"))
+    config = yaml_parser.load(open(args.config, "r", encoding="utf-8"))
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 

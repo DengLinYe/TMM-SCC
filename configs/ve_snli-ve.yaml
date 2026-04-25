@@ -1,7 +1,7 @@
 # 1. 数据与路径配置
-train_file: ["./data/snli-ve/ve_train.json"]
-val_file: "./data/snli-ve/ve_dev.json"
-test_file: "./data/snli-ve/ve_test.json"
+train_file: ["./data/snli-ve/ve_train_mini.json"]
+val_file: "./data/snli-ve/ve_dev_mini.json"
+test_file: "./data/snli-ve/ve_test_mini.json"
 image_root: "./data/flickr30k/flickr30k-images/"
 
 # 2. 模型结构配置
@@ -11,8 +11,8 @@ vision_width: 768
 embed_dim: 256
 
 # 3. 运行配置
-batch_size_train: 16
-batch_size_test: 16
+batch_size_train: 4 # 16
+batch_size_test: 4 # 16
 
 # 4. 对抗攻击参数
 epsilon: 12

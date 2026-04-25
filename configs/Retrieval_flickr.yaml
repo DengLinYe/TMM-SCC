@@ -1,4 +1,4 @@
-test_file: "./data/flickr30k/flickr30k_test.json"
+test_file: "./data/flickr30k/flickr30k_test_mini.json"
 image_root: "./data/flickr30k/"
 bert_config: "./configs/config_bert.json"
 image_res: 384

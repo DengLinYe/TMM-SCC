@@ -11,7 +11,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 
 class ve_dataset_attack(Dataset):
-    def __init__(self, ann_file, transform, image_root, args, max_words=30):
+    def __init__(self, ann_file, transform, image_root, max_words=30):
         self.ann = json.load(open(ann_file, "r"))
         self.transform = transform
         self.image_root = image_root
