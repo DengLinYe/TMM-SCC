@@ -56,18 +56,11 @@ class ImageProcessing:
         return delta
 
     def get_kernel(self, device, kernel_size=15):
-        """纯 PyTorch 实现的高斯平滑卷积核 (TI-FGSM 标准操作)"""
-        # 设定高斯分布的 sigma
         sigma = kernel_size / 2.0
-        # 创建 1D 网格
         grid = torch.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
-        # 计算 1D 高斯分布
         gaussian = torch.exp(-(grid**2) / (2 * sigma**2))
         gaussian = gaussian / gaussian.sum()
-        # 生成 2D 高斯核
         kernel2d = gaussian.unsqueeze(1) * gaussian.unsqueeze(0)
-        # 调整形状以适应 PyTorch 的 conv2d (groups=3)
-        # 形状要求: [out_channels, in_channels/groups, H, W]
         kernel = kernel2d.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1).to(device)
         return kernel
 
@@ -119,29 +112,21 @@ class ImageAttacker:
     def attack(self, image, attMap, num_iters):
         device = image.device
 
-        # ---------------- 核心防弹修复开始 ----------------
-        # 1. 强制尺寸对齐：如果之前安全阀传来了 224，强行转成和 image 一样的 384
         if attMap.shape[-1] != image.shape[-1]:
             attMap = torch.zeros_like(image).to(device)
 
-        # 2. 安全获取参数
         epsilon_per_val = getattr(self.args, "epsilon_per", 0.5)
         att_mask_val = getattr(self.args, "att_mask", 0.0)
 
         epsilon = self.epsilon * epsilon_per_val
         eosilon_att = self.epsilon - epsilon
-
-        # 3. 计算注意力面积，彻底告别“除以零”和“cpu().numpy()”报错
         att_sum = (attMap > att_mask_val).sum().float()
         total_pixels = float(image.shape[1] * image.shape[2] * image.shape[3])
 
         if att_sum == 0:
-            # 如果注意力图为空，直接给 0，防止除以 0 导致变成无穷大 (NaN)
             epsilon_att = 0.0
         else:
-            # 使用 .item() 提取数值，不再需要 detach().cpu().numpy()
             epsilon_att = (eosilon_att / (att_sum / total_pixels)).item()
-        # ---------------- 核心防弹修复结束 ----------------
 
         eps = epsilon / 255.0
         eps_att = epsilon_att / 255.0
@@ -188,7 +173,6 @@ class ImageAttacker:
             yield image_diversity
 
             if self.delta.grad is None:
-                # 如果运行到这里还是 None，说明反向传播没成功
                 print(
                     "Warning: self.delta.grad is None. Check if backward() is called."
                 )

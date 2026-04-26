@@ -16,7 +16,7 @@ class ve_dataset_attack(Dataset):
         self.transform = transform
         self.image_root = image_root
         self.max_words = max_words
-        self.label_map = {"entailment": 0, "neutral": 1, "contradiction": 2}
+        self.label_map = {"entailment": 2, "neutral": 1, "contradiction": 0}
 
     def __len__(self):
         return len(self.ann)

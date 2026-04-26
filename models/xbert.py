@@ -402,20 +402,15 @@ class BertSelfAttention(nn.Module):
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
-
-        # --- 暴力梯度捕获开始 ---
         self.attention_map = attention_probs
 
-        # 1. 强行把这个张量标记为需要梯度
         if not attention_probs.requires_grad:
             attention_probs.requires_grad_(True)
 
-        # 2. 重新注册钩子
         def save_grad(grad):
             self.attn_gradients = grad
 
         attention_probs.register_hook(save_grad)
-        # --- 暴力梯度捕获结束 ---
 
         # if is_cross_attention and self.save_attention:
         #     self.save_attention_map(attention_probs)

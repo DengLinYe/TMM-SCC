@@ -88,18 +88,13 @@ class MultiModalAttacker:
         """
         import torch.nn.functional as F
 
-        # 1. 确保是张量并在当前设备上
         if not torch.is_tensor(gradcam):
             gradcam = torch.from_numpy(gradcam).to(self.net.device)
 
-        # 2. 调整维度顺序以符合 PyTorch 的 [Batch, Channel, H, W] 规范
-        # [H, W, C] -> [1, C, H, W]
         x = gradcam.permute(2, 0, 1).unsqueeze(0)
 
-        # 3. 使用双线性插值直接缩放
         x = F.interpolate(x, size=shape, mode="bilinear", align_corners=False)
 
-        # 4. 归一化处理
         x_min = x.min()
         x_max = x.max()
         if x_max > x_min:
@@ -107,7 +102,6 @@ class MultiModalAttacker:
         else:
             x = x - x_min
 
-        # 5. 还原回原代码期望的 [target_H, target_W, C] 形状
         return x.squeeze(0).permute(1, 2, 0)
 
     def getAtt(self, attImage, text_input, device, indices, args):
@@ -187,7 +181,6 @@ class MultiModalAttacker:
                 cam.append(gradcam_layer)
 
             if len(cam) == 0:
-                # 如果没捕获到任何层的注意力，返回一个空的全零图
                 return torch.zeros((1, 3, 224, 224)).to(device)
 
             gradcam_final = 0
@@ -219,14 +212,16 @@ class MultiModalAttacker:
 
     def run_transfer_attack(self, images, text, args, num_iters, k=10, max_length=30):
         device = images.device
+
         (
             origin_embeds,
-            text_adv_embed,
+            _,
             text_input,
             origin_output,
-            text_adv_input,
-            text_adv,
+            _,
+            _,
         ) = self.get_origin_and_adv_embeds(images, text, device, max_length, k)
+
         loss_fn = torch.nn.CosineEmbeddingLoss()
 
         if args.dataset == "snli-ve":
@@ -241,27 +236,34 @@ class MultiModalAttacker:
         attMap = self.getAtt(attImage, text_input, device, indices, args)
         image_attack = self.image_attacker.attack(attImage, attMap, num_iters)
 
-        for i in range(num_iters):
-            if i % 10 == 0:
-                print(f"\r[Attack Process] Step: {i}/{num_iters}", end="", flush=True)
+        if hasattr(self.args, "text_method") and self.args.text_method == "scc":
+            _, _, _, _, scc_text_adv_input, scc_text_adv = (
+                self.get_origin_and_adv_embeds(images, text, device, max_length, k)
+            )
 
+        for i in range(num_iters):
             image_diversity = next(image_attack)
 
             if args.dataset == "snli-ve":
                 adv = image_diversity
             else:
                 adv = [
-                    image_diversity[i].repeat(5, 1, 1, 1)
-                    for i in range(image_diversity.shape[0])
+                    image_diversity[j].repeat(5, 1, 1, 1)
+                    for j in range(image_diversity.shape[0])
                 ]
                 if len(adv) > 0:
                     adv = torch.cat(adv, dim=0)
                 else:
                     adv = images
 
-            _, _, _, _, text_adv_input, text_adv = self.get_origin_and_adv_embeds(
-                adv.detach(), text, device, max_length, k
-            )
+            if hasattr(self.args, "text_method") and self.args.text_method == "scc":
+                text_adv_input = scc_text_adv_input
+                text_adv = scc_text_adv
+            else:
+                _, _, _, _, text_adv_input, text_adv = self.get_origin_and_adv_embeds(
+                    adv.detach(), text, device, max_length, k
+                )
+
             adv_output = self.net.inference(adv, text_adv_input, use_embeds=False)
 
             with torch.no_grad():
@@ -303,12 +305,13 @@ class MultiModalAttacker:
 
         if args.dataset != "snli-ve":
             images_adv = [
-                images_adv[i].repeat(5, 1, 1, 1) for i in range(images_adv.shape[0])
+                images_adv[j].repeat(5, 1, 1, 1) for j in range(images_adv.shape[0])
             ]
             images_adv = torch.cat(images_adv, dim=0)
 
-        _, _, _, _, _, text_adv = self.get_origin_and_adv_embeds(
-            adv, text, device, max_length, k
-        )
+        if not (hasattr(self.args, "text_method") and self.args.text_method == "scc"):
+            _, _, _, _, _, text_adv = self.get_origin_and_adv_embeds(
+                adv, text, device, max_length, k
+            )
 
         return images_adv, text_adv

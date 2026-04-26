@@ -1,27 +1,22 @@
-# 1. 数据与路径配置
 train_file: ["./data/snli-ve/ve_train_mini.json"]
 val_file: "./data/snli-ve/ve_dev_mini.json"
 test_file: "./data/snli-ve/ve_test_mini.json"
 image_root: "./data/flickr30k/flickr30k-images/"
 
-# 2. 模型结构配置
 bert_config: "./configs/config_bert.json"
 image_res: 384
 vision_width: 768
 embed_dim: 256
 
-# 3. 运行配置
-batch_size_train: 4 # 16
-batch_size_test: 4 # 16
+batch_size_train: 4
+batch_size_test: 4
 
-# 4. 对抗攻击参数
 epsilon: 12
-num_iters: 10
+num_iters: 5
 alpha: 0.4
 
-# 5. 训练与优化器防报错占位
-distill: False
-warm_up: True
+distill: false
+warm_up: true
 optimizer: { opt: adamW, lr: 1e-5, weight_decay: 0.02 }
 schedular:
   {

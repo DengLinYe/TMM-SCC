@@ -16,7 +16,7 @@ mini_files = [
 ]
 
 
-def sample_by_image(file_path, save_path, target_img_count=1000):
+def sample_by_image(file_path, save_path, target_img_count=100):
     with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 

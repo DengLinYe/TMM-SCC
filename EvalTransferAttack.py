@@ -10,14 +10,16 @@ import numpy as np
 import ruamel.yaml as yaml
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from PIL import Image
+from sentence_transformers import SentenceTransformer
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 from transformers import BertForMaskedLM
 
 import utils
-from attack import MultiModalAttacker, TextAttacker
+from attack import MultiModalAttacker
 from dataset import pair_dataset_attack
 from models.model_retrieval import ALBEF
 from models.tokenization_bert import BertTokenizer
@@ -33,7 +35,7 @@ class Model:
         self.ref_model = BertForMaskedLM.from_pretrained(text_encoder_name)
 
     def load_checkpoint(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = checkpoint.get("model", checkpoint)
         self.model.load_state_dict(state_dict, strict=False)
         print("Checkpoint loaded from %s" % checkpoint_path)
@@ -62,15 +64,38 @@ class Evaluation:
         print("Computing features for evaluation adv...")
         start_time = time.time()
 
+        sim_model = SentenceTransformer("all-MiniLM-L6-v2").to(self.device)
+        total_sim = 0.0
+        sim_count = 0
+
         images_normalize = transforms.Normalize(
             (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
         )
-        text_attacker = TextAttacker(
-            self.ref_model,
-            self.tokenizer,
-            next(self.model.parameters()).device,
-            cls=args.cls,
-        )
+
+        device = next(self.model.parameters()).device
+        if args.text_method == "tmm":
+            from attack.textAttack import TextAttacker
+
+            print(">>> 加载原版 TMM 文本攻击器...")
+            text_attacker = TextAttacker(
+                self.ref_model,
+                self.tokenizer,
+                device,
+                cls=args.cls,
+            )
+        elif args.text_method == "scc":
+            from attack.textAttackSCC import TextAttackerSCC
+
+            print(f">>> 加载 TMM-SCC 文本攻击器 (阈值: {args.sim_threshold})...")
+            text_attacker = TextAttackerSCC(
+                tokenizer=self.tokenizer,
+                device=device,
+                cls=args.cls,
+                sim_threshold=args.sim_threshold,
+            )
+        else:
+            raise ValueError(f"不支持的文本攻击方法: {args.text_method}")
+
         multi_attacker = MultiModalAttacker(
             net=self.model,
             text_attacker=text_attacker,
@@ -99,16 +124,25 @@ class Evaluation:
         for step, (images, texts, texts_ids, _) in enumerate(
             tqdm(self.data_loader, ascii=True)
         ):
-            if step >= 10:
-                print("\n>>> 快速验证：已完成 10 个 Batch，提前结束攻击循环 <<<")
-                torch.cuda.empty_cache()
-                break
+            # if step >= 20:
+            #     print("\n>>> 快速验证：已完成 20 个 Batch，提前结束攻击循环 <<<")
+            #     torch.cuda.empty_cache()
+            #     break
 
             images = images.to(self.device)
+            orig_texts = list(texts)
+
             if args.adv != 0:
                 images, texts = multi_attacker.run_transfer_attack(
                     images, texts, args, num_iters=config["num_iters"]
                 )
+
+            orig_embs = sim_model.encode(orig_texts, convert_to_tensor=True)
+            adv_embs = sim_model.encode(texts, convert_to_tensor=True)
+            batch_sims = F.cosine_similarity(orig_embs, adv_embs)
+
+            total_sim += batch_sims.sum().item()
+            sim_count += len(texts)
 
             for i in range(images.size(0)):
                 global_idx = step * config["batch_size_test"] + i
@@ -121,7 +155,9 @@ class Evaluation:
                         "image_id": global_idx,
                         "text_id": texts_ids[i].item(),
                         "image_path": img_filename,
+                        "orig_text": orig_texts[i],
                         "adv_text": texts[i],
+                        "sim_score": round(batch_sims[i].item(), 4),
                     }
                 )
 
@@ -144,8 +180,13 @@ class Evaluation:
 
             torch.cuda.empty_cache()
 
-        with open(args.save_json_name, "w", encoding="utf8") as f:
-            json.dump(adv_records, f, ensure_ascii=False, indent=2)
+        with open(
+            os.path.join(args.save_dir, "ve_adv_manifest.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(adv_records, f, indent=4, ensure_ascii=False)
+
+        avg_sim = total_sim / sim_count if sim_count > 0 else 0.0
+        print(f"Average Semantic Similarity: {avg_sim:.4f}")
 
         score_matrix_i2t, score_matrix_t2i = self.retrieval_score(
             image_feats,
@@ -161,7 +202,7 @@ class Evaluation:
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print("Evaluation time {}".format(total_time_str))
 
-        return score_matrix_i2t.cpu().numpy(), score_matrix_t2i.cpu().numpy()
+        return score_matrix_i2t.cpu().numpy(), score_matrix_t2i.cpu().numpy(), avg_sim
 
     def retrieval_score(
         self,
@@ -174,8 +215,6 @@ class Evaluation:
         num_text,
     ):
         self.device = next(self.model.parameters()).device
-
-        # self.config["k_test"] = 16  # 128
 
         metric_logger = utils.MetricLogger(delimiter="  ")
         header = "Evaluation Direction Similarity With Bert Attack:"
@@ -234,7 +273,16 @@ class Evaluation:
         ranks = np.zeros(scores_i2t.shape[0])
         for index, score in enumerate(scores_i2t):
             inds = np.argsort(score)[::-1]
-            ranks[index] = np.where(inds == img2txt[index][0])[0][0]
+
+            gt_text_ids = img2txt[index]
+
+            best_rank = 1e10
+            for i in gt_text_ids:
+                rank_pos = np.where(inds == i)[0][0]
+                if rank_pos < best_rank:
+                    best_rank = rank_pos
+            ranks[index] = best_rank
+
         tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
         tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
         tr10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
@@ -243,6 +291,7 @@ class Evaluation:
         for index, score in enumerate(scores_t2i):
             inds = np.argsort(score)[::-1]
             ranks[index] = np.where(inds == txt2img[index])[0][0]
+
         ir1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
         ir5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
         ir10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
@@ -306,13 +355,18 @@ def main(args, config):
         device,
         config,
     )
-    score_i2t, score_t2i = eval_handler.retrieval_eval()
+    score_i2t, score_t2i, avg_sim = eval_handler.retrieval_eval()
     result = eval_handler.itm_eval(
         score_i2t, score_t2i, test_dataset.img2txt, test_dataset.txt2img
     )
+
+    result["avg_sim"] = avg_sim
     print(result)
+
     log_stats = {
         **{f"test_{k}": v for k, v in result.items()},
+        "text_method": args.text_method,
+        "sim_threshold": args.sim_threshold,
         "eval type": args.adv,
         "cls": args.cls,
         "eps": config.get("epsilon", 12),
@@ -358,7 +412,19 @@ if __name__ == "__main__":
     parser.add_argument("--save_json_name", default="")
     parser.add_argument("--config_name", default="")
     parser.add_argument("--save_dir", default="")
-    parser.add_argument("--att_mask", default=0.1, type=int)
+    parser.add_argument("--att_mask", default=0.1, type=float)
+
+    parser.add_argument(
+        "--text_method",
+        type=str,
+        default="tmm",
+        choices=["tmm", "scc"],
+    )
+    parser.add_argument(
+        "--sim_threshold",
+        type=float,
+        default=0.65,
+    )
 
     args = parser.parse_args()
 

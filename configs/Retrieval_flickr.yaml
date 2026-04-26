@@ -2,8 +2,8 @@ test_file: "./data/flickr30k/flickr30k_test_mini.json"
 image_root: "./data/flickr30k/"
 bert_config: "./configs/config_bert.json"
 image_res: 384
-batch_size_train: 5
-batch_size_test: 5
+batch_size_train: 4
+batch_size_test: 4
 
 queue_size: 65536
 momentum: 0.995
