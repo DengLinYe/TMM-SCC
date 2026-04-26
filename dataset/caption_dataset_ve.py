@@ -24,15 +24,29 @@ class ve_dataset_attack(Dataset):
     def __getitem__(self, index):
         item = self.ann[index]
 
-        img_name = str(item["image"])
-        if not img_name.endswith(".jpg"):
-            img_name += ".jpg"
+        if "image_path" in item:
+            img_name = str(item["image_path"])
+        else:
+            img_id = item.get("image") or item.get("image_id")
+            img_name = str(img_id)
+            if not img_name.endswith((".jpg", ".png")):
+                img_name += ".jpg"
 
         image_path = os.path.join(self.image_root, img_name)
         image = Image.open(image_path).convert("RGB")
         image = self.transform(image)
 
-        text = pre_caption(item["sentence"], self.max_words)
-        label = self.label_map[item["label"]]
+        if "adv_text" in item:
+            text_content = item["adv_text"]
+        else:
+            text_content = item.get("sentence") or item.get("caption", "")
+
+        text = pre_caption(text_content, self.max_words)
+
+        raw_label = item["label"]
+        if isinstance(raw_label, int):
+            label = raw_label
+        else:
+            label = self.label_map[raw_label]
 
         return image, text, label

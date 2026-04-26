@@ -33,7 +33,7 @@ class ModelVE:
         self.ref_model = BertForMaskedLM.from_pretrained(text_encoder_name)
 
     def load_checkpoint(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = checkpoint.get("model", checkpoint)
         self.model.load_state_dict(state_dict, strict=False)
         print("Checkpoint loaded from %s" % checkpoint_path)

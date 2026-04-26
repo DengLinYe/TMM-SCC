@@ -10,9 +10,18 @@ EXCLUDE_DIRS = {
     "output",
     ".vscode",
 }
-EXCLUDE_FILES = {"TMM_Codebase.txt", "snapshot.py", ".gitignore"}
+EXCLUDE_FILES = {
+    "TMM_Codebase.txt",
+    "swin_transformer.py",
+    ".gitignore",
+    "tokenization_bert.py",
+    "tokenization_roberta.py",
+    "vit.py",
+    "xbert.py",
+    "xroberta.py",
+}
 # 允许读取的文件后缀
-EXTENSIONS = {".py", ".yaml", ".yml", ".json", ".md"}
+EXTENSIONS = {".py", ".yaml", ".yml", ".json"}
 
 
 def generate_snapshot():

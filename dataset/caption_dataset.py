@@ -1,4 +1,3 @@
-# dataset\caption_dataset.py
 import json
 import os
 
@@ -28,18 +27,42 @@ class pair_dataset_attack(Dataset):
         txt_id = 0
         for i, ann in enumerate(self.ann):
             self.img2txt[i] = []
-            for j, caption in enumerate(ann["caption"]):
-                self.image.append(ann["image"])
+
+            if "image_path" in ann:
+                img_name = str(ann["image_path"])
+            else:
+                img_name = str(ann.get("image") or ann.get("image_id"))
+                if not img_name.endswith((".jpg", ".png")):
+                    img_name += ".jpg"
+
+            if "adv_text" in ann:
+                captions = [ann["adv_text"]]
+            elif "caption" in ann:
+                captions = ann["caption"]
+                if isinstance(captions, str):
+                    captions = [captions]
+            else:
+                captions = [ann.get("sentence", "")]
+
+            for j, caption in enumerate(captions):
+                self.image.append(img_name)
                 self.text.append(pre_caption(caption, self.max_words))
                 self.txt2img[txt_id] = i
-                if args.dataset == "flickr":
-                    self.image_ids[txt_id] = ann["image"].split("/")[1].split(".")[0]
-                elif args.dataset == "mscoco":
-                    self.image_ids[txt_id] = (
-                        ann["image"].split("/")[1].split(".")[0].split("_")[2]
-                    )
-                if j == 5:
-                    print(ann["image"].split("/")[1].split(".")[0])
+
+                if "image_id" in ann:
+                    self.image_ids[txt_id] = str(ann["image_id"])
+                else:
+                    basename = os.path.basename(img_name)
+                    name_without_ext = os.path.splitext(basename)[0]
+
+                    if args.dataset == "flickr":
+                        self.image_ids[txt_id] = name_without_ext
+                    elif args.dataset == "mscoco":
+                        if "_" in name_without_ext:
+                            self.image_ids[txt_id] = name_without_ext.split("_")[-1]
+                        else:
+                            self.image_ids[txt_id] = name_without_ext
+
                 self.img2txt[i].append(txt_id)
                 txt_id += 1
 

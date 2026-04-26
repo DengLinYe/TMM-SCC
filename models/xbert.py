@@ -57,13 +57,11 @@ except ImportError:
     def apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
         return forward_fn(*input_tensors)
 
+    def find_pruneable_heads_and_indices(*args, **kwargs):
+        return set(), []
 
-def find_pruneable_heads_and_indices(*args, **kwargs):
-    return set(), []
-
-
-def prune_linear_layer(*args, **kwargs):
-    return args[0]
+    def prune_linear_layer(*args, **kwargs):
+        return args[0]
 
 
 transformers.logging.set_verbosity_error()
