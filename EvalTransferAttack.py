@@ -124,8 +124,8 @@ class Evaluation:
         for step, (images, texts, texts_ids, _) in enumerate(
             tqdm(self.data_loader, ascii=True)
         ):
-            # if step >= 20:
-            #     print("\n>>> 快速验证：已完成 20 个 Batch，提前结束攻击循环 <<<")
+            # if step >= 1:
+            #     print("\n>>> 快速验证：已完成 1 个 Batch，提前结束攻击循环 <<<")
             #     torch.cuda.empty_cache()
             #     break
 

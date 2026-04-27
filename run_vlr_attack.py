@@ -7,20 +7,23 @@ import time
 def run_final_experiments():
     cooldown_seconds = 300
 
-    os.makedirs("./output/VE_SCC/final", exist_ok=True)
-    os.makedirs("./output/VE_TMM/final", exist_ok=True)
+    scc_out_dir = "./output/VLR_SCC"
+    tmm_out_dir = "./output/VLR_TMM"
+
+    os.makedirs(scc_out_dir, exist_ok=True)
+    os.makedirs(tmm_out_dir, exist_ok=True)
 
     cmd_scc = [
         sys.executable,
-        "EvalVEAttack.py",
+        "EvalTransferAttack.py",
         "--adv",
         "1",
         "--gpu",
         "0",
         "--checkpoint",
-        "./checkpoints/albef_ve_snli_ve.pth",
+        "./checkpoints/albef_retrieval_flickr.pth",
         "--config",
-        "./configs/ve_snli-ve.yaml",
+        "./configs/Retrieval_flickr.yaml",
         "--save_json_name",
         "result.json",
         "--config_name",
@@ -30,24 +33,24 @@ def run_final_experiments():
         "--sim_threshold",
         "0.65",
         "--output_dir",
-        "./output/VE_SCC/final",
+        scc_out_dir,
         "--save_dir",
-        "./output/VE_SCC/final/",
+        f"{scc_out_dir}/",
         "--log_name",
         "result",
     ]
 
     cmd_tmm = [
         sys.executable,
-        "EvalVEAttack.py",
+        "EvalTransferAttack.py",
         "--adv",
         "1",
         "--gpu",
         "0",
         "--checkpoint",
-        "./checkpoints/albef_ve_snli_ve.pth",
+        "./checkpoints/albef_retrieval_flickr.pth",
         "--config",
-        "./configs/ve_snli-ve.yaml",
+        "./configs/Retrieval_flickr.yaml",
         "--save_json_name",
         "result.json",
         "--config_name",
@@ -55,21 +58,24 @@ def run_final_experiments():
         "--text_method",
         "tmm",
         "--output_dir",
-        "./output/VE_TMM/final",
+        tmm_out_dir,
         "--save_dir",
-        "./output/VE_TMM/final/",
+        f"{tmm_out_dir}/",
         "--log_name",
         "result",
     ]
 
-    print(">>> 开始执行最终实验: SCC 攻击")
+    print(">>> 开始执行 VLR 最终实验: SCC 攻击 (ALBEF)")
     subprocess.run(cmd_scc)
 
     print(f"\n>>> SCC 执行完毕。系统休眠 {cooldown_seconds} 秒以降低 GPU 温度...\n")
     time.sleep(cooldown_seconds)
 
-    print(">>> 开始执行最终实验: TMM 原版攻击")
+    print(">>> 开始执行 VLR 最终实验: TMM 原版攻击 (ALBEF)")
     subprocess.run(cmd_tmm)
+
+    print(f"\n>>> TMM 执行完毕。系统休眠 {cooldown_seconds} 秒以降低 GPU 温度...\n")
+    time.sleep(cooldown_seconds)
 
     print("\n>>> 所有最终实验执行完毕！")
 
@@ -84,5 +90,4 @@ def shutdown_system():
 
 if __name__ == "__main__":
     run_final_experiments()
-
     shutdown_system()

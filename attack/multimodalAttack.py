@@ -54,6 +54,10 @@ class MultiModalAttacker:
 
         with torch.no_grad():
             text_adv = self.text_attacker.attack(self.net, images, text, k)
+            if not text_adv:
+                print("警告：大模型请求失败，使用原句作为对抗文本")
+                text_adv = text
+
             text_adv_input = self.tokenizer(
                 text_adv,
                 padding="max_length",
@@ -307,6 +311,7 @@ class MultiModalAttacker:
             images_adv = [
                 images_adv[j].repeat(5, 1, 1, 1) for j in range(images_adv.shape[0])
             ]
+
             images_adv = torch.cat(images_adv, dim=0)
 
         if not (hasattr(self.args, "text_method") and self.args.text_method == "scc"):
