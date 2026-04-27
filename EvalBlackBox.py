@@ -1,13 +1,14 @@
-import argparse
 import datetime
 import json
 import os
 import random
+import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageFile
+from ruamel.yaml import YAML
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
@@ -20,10 +21,17 @@ from models.vit import interpolate_pos_embed
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
 
+# 测试模式：仅使用前5条数据进行快速验证，正式评测时请设置为 False
+TEST_MODE = False
+
 
 class pair_dataset_attack_robust(Dataset):
-    def __init__(self, ann_file, transform, image_root, args, max_words=30):
+    def __init__(self, ann_file, transform, image_root, max_words=30):
         self.ann = json.load(open(ann_file, "r"))
+
+        if TEST_MODE:
+            self.ann = self.ann[:5]
+
         self.transform = transform
         self.image_root = image_root
         self.max_words = max_words
@@ -33,6 +41,7 @@ class pair_dataset_attack_robust(Dataset):
         self.img2txt = {}
         self.image_ids = {}
         txt_id = 0
+
         for i, ann in enumerate(self.ann):
             self.img2txt[i] = []
             img_name = (
@@ -74,6 +83,10 @@ class pair_dataset_attack_robust(Dataset):
 class ve_dataset_attack_robust(Dataset):
     def __init__(self, ann_file, transform, image_root, max_words=30):
         self.ann = json.load(open(ann_file, "r"))
+
+        if TEST_MODE:
+            self.ann = self.ann[:5]
+
         self.transform = transform
         self.image_root = image_root
         self.max_words = max_words
@@ -100,13 +113,52 @@ class ve_dataset_attack_robust(Dataset):
         label = raw_label if isinstance(raw_label, int) else self.label_map[raw_label]
         return image, text, label
 
+    import numpy as np
 
-try:
-    from EvalTransferAttack import itm_eval
-except ImportError:
 
-    def itm_eval(scores_i2t, scores_t2i, img2txt, txt2img):
-        pass
+def itm_eval(scores_i2t, scores_t2i, img2txt, txt2img):
+    ranks = np.zeros(scores_i2t.shape[0])
+    for index, score in enumerate(scores_i2t):
+        inds = np.argsort(score)[::-1]
+
+        gt_text_ids = img2txt[index]
+
+        best_rank = 1e10
+        for i in gt_text_ids:
+            rank_pos = np.where(inds == i)[0][0]
+            if rank_pos < best_rank:
+                best_rank = rank_pos
+        ranks[index] = best_rank
+
+    tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    tr10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+    ranks = np.zeros(scores_t2i.shape[0])
+    for index, score in enumerate(scores_t2i):
+        inds = np.argsort(score)[::-1]
+        ranks[index] = np.where(inds == txt2img[index])[0][0]
+
+    ir1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    ir5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    ir10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+    tr_mean = (tr1 + tr5 + tr10) / 3
+    ir_mean = (ir1 + ir5 + ir10) / 3
+    r_mean = (tr_mean + ir_mean) / 2
+
+    eval_result = {
+        "txt_r1": tr1,
+        "txt_r5": tr5,
+        "txt_r10": tr10,
+        "img_r1": ir1,
+        "img_r5": ir5,
+        "img_r10": ir10,
+        "txt_r_mean": tr_mean,
+        "img_r_mean": ir_mean,
+        "r_mean": r_mean,
+    }
+    return eval_result
 
 
 def evaluate_vlr(model, data_loader, tokenizer, device):
@@ -144,7 +196,7 @@ def evaluate_vlr(model, data_loader, tokenizer, device):
                     b_img = b_img.unsqueeze(0).to(device)
                     image_feat = model.visual_encoder(b_img)
                     image_embed = F.normalize(
-                        model.visual_proj(image_feat[:, 0, :]), dim=-1
+                        model.vision_proj(image_feat[:, 0, :]), dim=-1
                     )
                     image_embeds.append(image_embed)
         image_embeds = torch.cat(image_embeds, dim=0)
@@ -174,103 +226,147 @@ def evaluate_ve(model, data_loader, tokenizer, device):
     return correct / total
 
 
-def main(args, config):
-    device = torch.device(args.device)
-    seed = args.seed
+def main():
+    device = torch.device("cuda")
+    seed = 42
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
     normalize = transforms.Normalize(
         (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
     )
-    test_transform = transforms.Compose(
-        [
-            transforms.Resize(
-                (config["image_res"], config["image_res"]), interpolation=Image.BICUBIC
-            ),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
 
-    tokenizer = BertTokenizer.from_pretrained(args.text_encoder)
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    log_dir = "./output/result/results_log"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    log_path = os.path.join(log_dir, "blackbox_results_log.json")
 
-    if args.task == "vlr":
-        test_dataset = pair_dataset_attack_robust(
-            args.adv_json, test_transform, args.adv_image_root, args
-        )
-        test_loader = DataLoader(
-            test_dataset, batch_size=config["batch_size_test"], num_workers=4
-        )
-        model = TCL_Retrieval(
-            config=config, text_encoder=args.text_encoder, tokenizer=tokenizer
-        )
-    elif args.task == "ve":
-        test_dataset = ve_dataset_attack_robust(
-            args.adv_json, test_transform, args.adv_image_root
-        )
-        test_loader = DataLoader(
-            test_dataset, batch_size=config["batch_size_test"], num_workers=4
-        )
-        model = TCL_VE(
-            config=config, text_encoder=args.text_encoder, tokenizer=tokenizer
+    yaml_parser = YAML(typ="safe")
+
+    tasks = [
+        {
+            "task_name": "VE",
+            "method": "SCC",
+            "config": "./configs/ve_snli-ve.yaml",
+            "checkpoint": "./checkpoints/tcl_ve_snli_ve.pth",
+            "adv_json": "./output/VE_SCC/final/ve_adv_manifest.json",
+            "adv_image_root": "./output/VE_SCC/final/adv_samples_ve",
+        },
+        {
+            "task_name": "VE",
+            "method": "TMM",
+            "config": "./configs/ve_snli-ve.yaml",
+            "checkpoint": "./checkpoints/tcl_ve_snli_ve.pth",
+            "adv_json": "./output/VE_TMM/final/ve_adv_manifest.json",
+            "adv_image_root": "./output/VE_TMM/final/adv_samples_ve",
+        },
+        {
+            "task_name": "VLR",
+            "method": "SCC",
+            "config": "./configs/Retrieval_flickr.yaml",
+            "checkpoint": "./checkpoints/tcl_retrieval_flickr.pth",
+            "adv_json": "./output/VLR_SCC/ve_adv_manifest.json",
+            "adv_image_root": "./output/VLR_SCC/adv_samples_retrieval",
+        },
+        {
+            "task_name": "VLR",
+            "method": "TMM",
+            "config": "./configs/Retrieval_flickr.yaml",
+            "checkpoint": "./checkpoints/tcl_retrieval_flickr.pth",
+            "adv_json": "./output/VLR_TMM/ve_adv_manifest.json",
+            "adv_image_root": "./output/VLR_TMM/adv_samples_retrieval",
+        },
+    ]
+
+    for t in tasks:
+        print(f"\n{'=' * 50}")
+        print(f">>> 开始执行黑盒评估: 任务={t['task_name']}, 方法={t['method']}")
+        print(f"{'=' * 50}")
+
+        with open(t["config"], "r", encoding="utf-8") as f:
+            config = yaml_parser.load(f)
+
+        test_transform = transforms.Compose(
+            [
+                transforms.Resize(
+                    (config["image_res"], config["image_res"]),
+                    interpolation=Image.BICUBIC,
+                ),
+                transforms.ToTensor(),
+                normalize,
+            ]
         )
 
-    if args.checkpoint:
-        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        if t["task_name"] == "VLR":
+            test_dataset = pair_dataset_attack_robust(
+                t["adv_json"], test_transform, t["adv_image_root"]
+            )
+            test_loader = DataLoader(
+                test_dataset, batch_size=config["batch_size_test"], num_workers=4
+            )
+            model = TCL_Retrieval(
+                config=config, text_encoder="bert-base-uncased", tokenizer=tokenizer
+            )
+        else:
+            test_dataset = ve_dataset_attack_robust(
+                t["adv_json"], test_transform, t["adv_image_root"]
+            )
+            test_loader = DataLoader(
+                test_dataset, batch_size=config["batch_size_test"], num_workers=4
+            )
+            model = TCL_VE(
+                config=config, text_encoder="bert-base-uncased", tokenizer=tokenizer
+            )
+
+        checkpoint = torch.load(t["checkpoint"], map_location="cpu", weights_only=False)
         state_dict = checkpoint.get("model", checkpoint)
         pos_embed_reshaped = interpolate_pos_embed(
             state_dict["visual_encoder.pos_embed"], model.visual_encoder
         )
         state_dict["visual_encoder.pos_embed"] = pos_embed_reshaped
         model.load_state_dict(state_dict, strict=False)
+        model = model.to(device)
 
-    model = model.to(device)
-    start_eval_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    results = {}
+        start_eval_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        results = {}
 
-    if args.task == "vlr":
-        score_i2t, score_t2i = evaluate_vlr(model, test_loader, model.tokenizer, device)
-        results = itm_eval(
-            score_i2t,
-            score_t2i,
-            test_loader.dataset.img2txt,
-            test_loader.dataset.txt2img,
-        )
-    elif args.task == "ve":
-        acc = evaluate_ve(model, test_loader, model.tokenizer, device)
-        results = {"accuracy": acc}
+        if t["task_name"] == "VLR":
+            score_i2t, score_t2i = evaluate_vlr(model, test_loader, tokenizer, device)
+            results = itm_eval(
+                score_i2t,
+                score_t2i,
+                test_loader.dataset.img2txt,
+                test_loader.dataset.txt2img,
+            )
+        else:
+            acc = evaluate_ve(model, test_loader, tokenizer, device)
+            results = {"accuracy": acc}
 
-    if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir)
-    log_path = os.path.join(args.log_dir, "blackbox_results_log.json")
-    log_data = {
-        "timestamp": start_eval_time,
-        "task": args.task,
-        "adv_data": {"adv_json": args.adv_json, "adv_image_root": args.adv_image_root},
-        "checkpoint": args.checkpoint,
-        "results": results,
-    }
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
+        log_data = {
+            "timestamp": start_eval_time,
+            "task": t["task_name"],
+            "method": t["method"],
+            "target_model": "TCL",
+            "adv_data": {
+                "adv_json": t["adv_json"],
+                "adv_image_root": t["adv_image_root"],
+            },
+            "checkpoint": t["checkpoint"],
+            "results": results,
+        }
+
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
+
+        print(f">>> {t['task_name']} ({t['method']}) 评估完成，结果已写入 JSON。")
+        print(results)
+
+        torch.cuda.empty_cache()
+        time.sleep(30)
+
+    print("\n>>> 所有黑盒评测任务执行完毕！")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="./configs/Retrieval_flickr.yaml")
-    parser.add_argument("--checkpoint", default="")
-    parser.add_argument("--log_dir", default="./results_log")
-    parser.add_argument("--text_encoder", default="bert-base-uncased")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--seed", default=42, type=int)
-    parser.add_argument("--task", default="vlr", choices=["vlr", "ve"])
-    parser.add_argument("--dataset", default="flickr", choices=["flickr"])
-    parser.add_argument("--adv_json", required=True, type=str)
-    parser.add_argument("--adv_image_root", required=True, type=str)
-    args = parser.parse_args()
-    from ruamel.yaml import YAML
-
-    yaml = YAML(typ="safe")
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = yaml.load(f)
-    main(args, config)
+    main()
