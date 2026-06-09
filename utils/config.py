@@ -39,6 +39,7 @@ SUBSET_PRESETS: Dict[str, SubsetSpec] = {
     "main_1k": SubsetSpec("main_1k", vlr_image_count=1000, ve_entry_count=1000),
     "ablation_200": SubsetSpec("ablation_200", vlr_image_count=200, ve_entry_count=200),
     "mini_100": SubsetSpec("mini_100", vlr_image_count=100, ve_entry_count=100),
+    "smoke_20": SubsetSpec("smoke_20", vlr_image_count=20, ve_entry_count=20),
 }
 
 

@@ -59,7 +59,7 @@ def checkpoint_arg(task: str, target: str) -> str:
     return rel_path(ckpt)
 
 
-def run_blackbox_eval(job: dict, dry_run: bool = False) -> int:
+def run_blackbox_eval(job: dict, dry_run: bool = False, gpu: int = 0) -> int:
     manifest = manifest_path(job["task"], job["surrogate"], job["method"], job["subset"])
     adv_dir = adv_samples_dir(job["task"], job["surrogate"], job["method"], job["subset"])
 
@@ -93,6 +93,8 @@ def run_blackbox_eval(job: dict, dry_run: bool = False) -> int:
         job["subset"],
         "--log",
         rel_path(blackbox_log_path()),
+        "--gpu",
+        str(job.get("gpu", 0)),
     ]
 
     label = METHOD_LABELS.get(job["method"], job["method"])
@@ -112,6 +114,8 @@ def main(argv=None):
     parser.add_argument("--method", choices=["tmm", "scc", "all"], default="all")
     parser.add_argument("--target", nargs="+", default=None)
     parser.add_argument("--subset", default="main_1k")
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -124,10 +128,12 @@ def main(argv=None):
 
     blackbox_log_path().parent.mkdir(parents=True, exist_ok=True)
     jobs = build_blackbox_jobs(tasks, methods, targets, args.subset)
+    for job in jobs:
+        job["gpu"] = args.gpu
 
     failed = 0
     for job in jobs:
-        if run_blackbox_eval(job, dry_run=args.dry_run) != 0:
+        if run_blackbox_eval(job, dry_run=args.dry_run, gpu=args.gpu) != 0:
             failed += 1
 
     if failed:

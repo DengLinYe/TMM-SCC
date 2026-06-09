@@ -14,7 +14,7 @@ THIRD_PARTY = {
 }
 
 
-def write_finetune_config(backbone: str, subset: str, out_dir: Path) -> Path:
+def write_finetune_config(backbone: str, subset: str, out_dir: Path, epochs: int = None) -> Path:
     yaml = YAML()
     yaml.preserve_quotes = True
     template = THIRD_PARTY[backbone] / "configs" / "VE.yaml"
@@ -25,10 +25,13 @@ def write_finetune_config(backbone: str, subset: str, out_dir: Path) -> Path:
     if not test_ann.exists():
         test_ann = DATA / "snli-ve" / "ve_test.json"
 
-    config["train_file"] = f"../../data/snli-ve/ve_train.json"
-    config["val_file"] = f"../../data/snli-ve/ve_dev.json"
+    config["train_file"] = "../../data/snli-ve/ve_train.json"
+    config["val_file"] = "../../data/snli-ve/ve_dev.json"
     config["test_file"] = f"../../data/snli-ve/{test_ann.name}"
     config["image_root"] = "../../data/flickr30k/flickr30k-images/"
+
+    if epochs is not None and "schedular" in config:
+        config["schedular"]["epochs"] = epochs
 
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = out_dir / "config.yaml"
@@ -64,7 +67,9 @@ def main(argv=None):
         sys.exit(1)
 
     out_dir = finetune_output_dir(args.backbone)
-    cfg_path = write_finetune_config(args.backbone, args.subset, out_dir)
+    cfg_path = write_finetune_config(
+        args.backbone, args.subset, out_dir, epochs=args.epochs
+    )
 
     cmd = [
         sys.executable,
