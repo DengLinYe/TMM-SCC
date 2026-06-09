@@ -1,0 +1,23 @@
+﻿--extra-index-url https://download.pytorch.org/whl/cu130
+torch
+torchvision
+
+ruamel.yaml
+pillow
+requests
+tqdm
+scipy
+setuptools<82
+protobuf
+opencv-python
+
+tokenizers>=0.19
+transformers>=4.38.2
+timm==0.4.9
+bert_score==0.3.13
+sentence-transformers
+spacy
+openai
+
+scikit-image
+pytorch-msssim

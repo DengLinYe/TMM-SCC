@@ -1,7 +1,14 @@
 /tmm_env/
 /data/
 /checkpoints/
-*.txt
-__pycache__
+/outputs/
 /output/
+__pycache__/
+*.pyc
+*.txt
+!requirements.txt
 baseline_results.json
+.cursorignore
+
+third_party/*/output/
+third_party/*/checkpoints/
