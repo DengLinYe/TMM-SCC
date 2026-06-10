@@ -33,9 +33,12 @@ class ALBEF(nn.Module):
         )
 
         bert_config = BertConfig.from_json_file(config["bert_config"])
-        self.text_encoder = BertModel.from_pretrained(
-            text_encoder, config=bert_config, add_pooling_layer=False
-        )
+        if config.get("init_text_encoder_from_pretrained", True):
+            self.text_encoder = BertModel.from_pretrained(
+                text_encoder, config=bert_config, add_pooling_layer=False
+            )
+        else:
+            self.text_encoder = BertModel(bert_config)
 
         text_width = self.text_encoder.config.hidden_size
         self.vision_proj = nn.Linear(vision_width, embed_dim)
@@ -58,9 +61,12 @@ class ALBEF(nn.Module):
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
         )
         self.vision_proj_m = nn.Linear(vision_width, embed_dim)
-        self.text_encoder_m = BertModel.from_pretrained(
-            text_encoder, config=bert_config, add_pooling_layer=False
-        )
+        if config.get("init_text_encoder_from_pretrained", True):
+            self.text_encoder_m = BertModel.from_pretrained(
+                text_encoder, config=bert_config, add_pooling_layer=False
+            )
+        else:
+            self.text_encoder_m = BertModel(bert_config)
         self.text_proj_m = nn.Linear(text_width, embed_dim)
 
         self.model_pairs = [

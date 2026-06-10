@@ -1,63 +1,27 @@
-from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional
+"""按步骤串联 prepare / finetune / attack / ablation / blackbox。"""
 
+from typing import List
+
+from .config import (
+    CLOUD_ABLATION_PROFILE,
+    CLOUD_MAIN_FULL_PROFILE,
+    CLOUD_MAIN_NO_FINETUNE_PROFILE,
+    CLOUD_TEST_FULL_PROFILE,
+    PIPELINE_FULL_PROFILE,
+    PIPELINE_TEST_FORCE_PROFILE,
+    PIPELINE_TEST_PROFILE,
+    SUBSET_PRESETS,
+    RunProfile,
+    apply_hardware,
+    profile_with_gpu,
+)
+from .finetune_ve import main as finetune_main
+from .log import banner, die, ok, warn
+from .output import append_run_log, build_experiment_record, clean_for_cloud_main
 from .prepare_subset import main as prepare_main
 from .run_ablation import main as ablation_main
 from .run_attack import main as attack_main
 from .run_blackbox import main as blackbox_main
-from .finetune_ve import main as finetune_main
-
-
-@dataclass
-class RunProfile:
-    name: str
-    subset: str = "main_1k"
-    ablation_subset: str = "ablation_200"
-    num_iters: Optional[int] = None
-    attack_task: str = "all"
-    attack_method: str = "all"
-    blackbox_task: str = "all"
-    blackbox_method: str = "all"
-    blackbox_targets: Optional[Dict[str, List[str]]] = None
-    ablation_iters: List[int] = field(default_factory=lambda: [3, 5, 10, 20])
-    cooldown: int = 120
-    gpu: int = 0
-    finetune_backbone: str = "albef"
-    finetune_backbones: Optional[List[str]] = None
-    finetune_epochs: Optional[int] = None
-    dry_run: bool = False
-
-
-# 快速验证：小样本 + 低迭代，但步骤与正式实验一致（全覆盖）
-QUICK_PROFILE = RunProfile(
-    name="quick",
-    subset="smoke_20",
-    ablation_subset="smoke_20",
-    num_iters=2,
-    attack_task="all",
-    attack_method="all",
-    blackbox_task="all",
-    blackbox_method="all",
-    blackbox_targets={"vlr": ["tcl", "clip"], "ve": ["tcl"]},
-    ablation_iters=[2, 3],
-    cooldown=0,
-    finetune_epochs=2,
-    finetune_backbones=["albef", "tcl"],
-)
-
-FULL_PROFILE = RunProfile(
-    name="full",
-    subset="main_1k",
-    ablation_subset="ablation_200",
-    attack_task="all",
-    attack_method="all",
-    blackbox_task="all",
-    blackbox_method="all",
-    cooldown=120,
-)
-
-QUICK_STEPS = ["prepare", "finetune", "attack", "ablation", "blackbox"]
-FULL_STEPS = ["prepare", "attack", "blackbox"]
 
 
 def _extra_args(profile: RunProfile) -> List[str]:
@@ -72,21 +36,22 @@ def run_prepare(profile: RunProfile) -> None:
 
 
 def run_attack(profile: RunProfile) -> None:
-    argv = [
-        "--task",
-        profile.attack_task,
-        "--method",
-        profile.attack_method,
-        "--subset",
-        profile.subset,
-        "--gpu",
-        str(profile.gpu),
-        "--cooldown",
-        str(profile.cooldown),
-    ] + _extra_args(profile)
-    if profile.num_iters is not None:
-        argv.extend(["--num-iters", str(profile.num_iters)])
-    attack_main(argv)
+    attack_main(
+        [
+            "--task",
+            profile.attack_task,
+            "--method",
+            profile.attack_method,
+            "--subset",
+            profile.subset,
+            "--gpu",
+            str(profile.gpu),
+            "--cooldown",
+            str(profile.cooldown),
+        ]
+        + _extra_args(profile),
+        profile=profile,
+    )
 
 
 def run_blackbox(profile: RunProfile) -> None:
@@ -100,18 +65,7 @@ def run_blackbox(profile: RunProfile) -> None:
         "--gpu",
         str(profile.gpu),
     ] + _extra_args(profile)
-    if profile.blackbox_targets:
-        if profile.blackbox_task == "all":
-            targets = []
-            for key in ("vlr", "ve"):
-                for t in profile.blackbox_targets.get(key, []):
-                    if t not in targets:
-                        targets.append(t)
-        else:
-            targets = profile.blackbox_targets.get(profile.blackbox_task, ["tcl"])
-        if targets:
-            argv.extend(["--target"] + targets)
-    blackbox_main(argv)
+    blackbox_main(argv, profile=profile)
 
 
 def run_ablation(profile: RunProfile) -> None:
@@ -124,7 +78,7 @@ def run_ablation(profile: RunProfile) -> None:
         str(profile.cooldown),
         "--iters",
     ] + [str(i) for i in profile.ablation_iters] + _extra_args(profile)
-    ablation_main(argv)
+    ablation_main(argv, profile=profile)
 
 
 def run_finetune(profile: RunProfile) -> None:
@@ -140,7 +94,13 @@ def run_finetune(profile: RunProfile) -> None:
         ] + _extra_args(profile)
         if profile.finetune_epochs is not None:
             argv.extend(["--epochs", str(profile.finetune_epochs)])
-        finetune_main(argv)
+        if profile.skip_finetune_if_ready and not profile.force_finetune:
+            argv.append("--skip-if-exists")
+        if profile.force_finetune:
+            argv.append("--force")
+        rc = finetune_main(argv)
+        if rc != 0:
+            die(f"步骤 finetune 失败: backbone={backbone} (exit {rc})", module="pipeline")
 
 
 STEP_RUNNERS = {
@@ -153,28 +113,60 @@ STEP_RUNNERS = {
 
 
 def run_pipeline(steps: List[str], profile: RunProfile) -> None:
+    if profile.clean_outputs_before and not profile.dry_run:
+        warn("清理 outputs/（保留 run.json 与 ablation_200）", module="pipeline")
+        clean_for_cloud_main()
+    if not profile.dry_run:
+        spec = SUBSET_PRESETS.get(profile.subset)
+        config = {
+            "profile": profile.name,
+            "subset": profile.subset,
+            "steps": steps,
+        }
+        if spec:
+            config["vlr_image_count"] = spec.vlr_image_count
+            config["ve_entry_count"] = spec.ve_entry_count
+        append_run_log(
+            build_experiment_record(f"pipeline_{profile.name}", config, {})
+        )
     for step in steps:
         if step not in STEP_RUNNERS:
-            raise ValueError(f"未知步骤: {step}")
-        print(f"\n{'#' * 60}\n# {profile.name} / {step}\n{'#' * 60}")
+            die(f"未知步骤: {step}", module="pipeline")
+        banner(f"{profile.name} / {step}")
         STEP_RUNNERS[step](profile)
-    print("\n[+] 流水线执行完毕")
+    ok("流水线执行完毕", module="pipeline")
 
 
-def run_quick(gpu: int = 0, dry_run: bool = False) -> None:
-    profile = replace(QUICK_PROFILE, gpu=gpu, dry_run=dry_run)
-    run_pipeline(QUICK_STEPS, profile)
+def run_pipeline_test() -> None:
+    profile = profile_with_gpu(PIPELINE_TEST_PROFILE)
+    run_pipeline(profile.steps, profile)
 
 
-def run_full(gpu: int = 0, dry_run: bool = False, with_ablation: bool = False) -> None:
-    profile = replace(FULL_PROFILE, gpu=gpu, dry_run=dry_run)
-    steps = list(FULL_STEPS)
-    if with_ablation:
-        steps.append("ablation")
-    run_pipeline(steps, profile)
+def run_pipeline_full() -> None:
+    profile = profile_with_gpu(PIPELINE_FULL_PROFILE)
+    run_pipeline(profile.steps, profile)
 
 
-# 兼容旧名
-run_smoke = run_quick
+def run_pipeline_test_force() -> None:
+    profile = profile_with_gpu(PIPELINE_TEST_FORCE_PROFILE)
+    run_pipeline(profile.steps, profile)
 
-PROFILES = {"quick": QUICK_PROFILE, "smoke": QUICK_PROFILE, "full": FULL_PROFILE}
+
+def run_cloud_test_full(preset: str = "server_24g") -> None:
+    profile = apply_hardware(profile_with_gpu(CLOUD_TEST_FULL_PROFILE), preset)
+    run_pipeline(profile.steps, profile)
+
+
+def run_cloud_ablation(preset: str = "server_24g") -> None:
+    profile = apply_hardware(profile_with_gpu(CLOUD_ABLATION_PROFILE), preset)
+    run_pipeline(profile.steps, profile)
+
+
+def run_cloud_main_full(preset: str = "server_24g") -> None:
+    profile = apply_hardware(profile_with_gpu(CLOUD_MAIN_FULL_PROFILE), preset)
+    run_pipeline(profile.steps, profile)
+
+
+def run_cloud_main_no_finetune(preset: str = "server_24g") -> None:
+    profile = apply_hardware(profile_with_gpu(CLOUD_MAIN_NO_FINETUNE_PROFILE), preset)
+    run_pipeline(profile.steps, profile)

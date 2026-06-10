@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 import argparse
 import datetime
 import json
@@ -34,7 +38,21 @@ class Model:
         )
         self.ref_model = BertForMaskedLM.from_pretrained(text_encoder_name)
 
-    def load_checkpoint(self, checkpoint_path):
+    def load_checkpoint(self, checkpoint_path, victim="albef"):
+        victim = victim or "albef"
+        if victim in ("tcl", "blip"):
+            from victim_loader import load_victim_checkpoint
+
+            self.model, _ = load_victim_checkpoint(
+                "vlr",
+                self.config,
+                checkpoint_path,
+                torch.device("cpu"),
+                target=victim,
+            )
+            print("Checkpoint loaded from %s" % checkpoint_path)
+            return
+
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = checkpoint.get("model", checkpoint)
         self.model.load_state_dict(state_dict, strict=False)
@@ -61,10 +79,11 @@ class Evaluation:
         self.model.eval()
         self.ref_model.eval()
 
-        print("Computing features for evaluation adv...")
+        clean_mode = args.adv == 0 or getattr(args, "clean_eval", False)
+        label = "clean" if clean_mode else "adv"
+        print(f"Computing features for evaluation ({label})...")
         start_time = time.time()
 
-        sim_model = SentenceTransformer("all-MiniLM-L6-v2").to(self.device)
         total_sim = 0.0
         sim_count = 0
 
@@ -72,37 +91,41 @@ class Evaluation:
             (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
         )
 
-        device = next(self.model.parameters()).device
-        if args.text_method == "tmm":
-            from attack.textAttack import TextAttacker
+        multi_attacker = None
+        sim_model = None
+        if not clean_mode:
+            sim_model = SentenceTransformer("all-MiniLM-L6-v2").to(self.device)
+            device = next(self.model.parameters()).device
+            if args.text_method == "tmm":
+                from attack.textAttack import TextAttacker
 
-            print(">>> 加载原版 TMM 文本攻击器...")
-            text_attacker = TextAttacker(
-                self.ref_model,
-                self.tokenizer,
-                device,
-                cls=args.cls,
-            )
-        elif args.text_method == "scc":
-            from attack.textAttackSCC import TextAttackerSCC
+                print(">>> 加载原版 TMM 文本攻击器...")
+                text_attacker = TextAttacker(
+                    self.ref_model,
+                    self.tokenizer,
+                    device,
+                    cls=args.cls,
+                )
+            elif args.text_method == "scc":
+                from attack.textAttackSCC import TextAttackerSCC
 
-            print(f">>> 加载 TMM-SCC 文本攻击器 (阈值: {args.sim_threshold})...")
-            text_attacker = TextAttackerSCC(
+                print(f">>> 加载 TMM-SCC 文本攻击器 (阈值: {args.sim_threshold})...")
+                text_attacker = TextAttackerSCC(
+                    tokenizer=self.tokenizer,
+                    device=device,
+                    cls=args.cls,
+                    sim_threshold=args.sim_threshold,
+                )
+            else:
+                raise ValueError(f"不支持的文本攻击方法: {args.text_method}")
+
+            multi_attacker = MultiModalAttacker(
+                net=self.model,
+                text_attacker=text_attacker,
                 tokenizer=self.tokenizer,
-                device=device,
+                args=args,
                 cls=args.cls,
-                sim_threshold=args.sim_threshold,
             )
-        else:
-            raise ValueError(f"不支持的文本攻击方法: {args.text_method}")
-
-        multi_attacker = MultiModalAttacker(
-            net=self.model,
-            text_attacker=text_attacker,
-            tokenizer=self.tokenizer,
-            args=args,
-            cls=args.cls,
-        )
 
         print("Prepare memory")
         num_text = len(self.data_loader.dataset.text)
@@ -116,50 +139,47 @@ class Evaluation:
         text_atts = torch.zeros(num_text, 30).long()
 
         adv_save_dir = os.path.join(args.save_dir, "adv_samples_retrieval")
-        os.makedirs(adv_save_dir, exist_ok=True)
         adv_records = []
+        if not clean_mode:
+            os.makedirs(adv_save_dir, exist_ok=True)
         import torchvision
 
         print("Forward")
         for step, (images, texts, texts_ids, _) in enumerate(
             tqdm(self.data_loader, ascii=True)
         ):
-            # if step >= 1:
-            #     print("\n>>> 快速验证：已完成 1 个 Batch，提前结束攻击循环 <<<")
-            #     torch.cuda.empty_cache()
-            #     break
-
             images = images.to(self.device)
             orig_texts = list(texts)
 
-            if args.adv != 0:
+            if args.adv != 0 and multi_attacker is not None:
                 images, texts = multi_attacker.run_transfer_attack(
                     images, texts, args, num_iters=config["num_iters"]
                 )
 
-            orig_embs = sim_model.encode(orig_texts, convert_to_tensor=True)
-            adv_embs = sim_model.encode(texts, convert_to_tensor=True)
-            batch_sims = F.cosine_similarity(orig_embs, adv_embs)
+            if not clean_mode:
+                orig_embs = sim_model.encode(orig_texts, convert_to_tensor=True)
+                adv_embs = sim_model.encode(texts, convert_to_tensor=True)
+                batch_sims = F.cosine_similarity(orig_embs, adv_embs)
 
-            total_sim += batch_sims.sum().item()
-            sim_count += len(texts)
+                total_sim += batch_sims.sum().item()
+                sim_count += len(texts)
 
-            for i in range(images.size(0)):
-                global_idx = step * config["batch_size_test"] + i
-                img_filename = f"adv_{global_idx}.png"
-                img_path = os.path.join(adv_save_dir, img_filename)
-                torchvision.utils.save_image(images[i], img_path)
+                for i in range(images.size(0)):
+                    global_idx = step * config["batch_size_test"] + i
+                    img_filename = f"adv_{global_idx}.png"
+                    img_path = os.path.join(adv_save_dir, img_filename)
+                    torchvision.utils.save_image(images[i], img_path)
 
-                adv_records.append(
-                    {
-                        "image_id": global_idx,
-                        "text_id": texts_ids[i].item(),
-                        "image_path": img_filename,
-                        "orig_text": orig_texts[i],
-                        "adv_text": texts[i],
-                        "sim_score": round(batch_sims[i].item(), 4),
-                    }
-                )
+                    adv_records.append(
+                        {
+                            "image_id": global_idx,
+                            "text_id": texts_ids[i].item(),
+                            "image_path": img_filename,
+                            "orig_text": orig_texts[i],
+                            "adv_text": texts[i],
+                            "sim_score": round(batch_sims[i].item(), 4),
+                        }
+                    )
 
             texts_input = self.tokenizer(
                 texts,
@@ -180,13 +200,17 @@ class Evaluation:
 
             torch.cuda.empty_cache()
 
-        with open(
-            os.path.join(args.save_dir, "vlr_adv_manifest.json"), "w", encoding="utf-8"
-        ) as f:
-            json.dump(adv_records, f, indent=4, ensure_ascii=False)
+        if not clean_mode:
+            with open(
+                os.path.join(args.save_dir, "vlr_adv_manifest.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(adv_records, f, indent=4, ensure_ascii=False)
 
         avg_sim = total_sim / sim_count if sim_count > 0 else 0.0
-        print(f"Average Semantic Similarity: {avg_sim:.4f}")
+        if not clean_mode:
+            print(f"Average Semantic Similarity: {avg_sim:.4f}")
 
         score_matrix_i2t, score_matrix_t2i = self.retrieval_score(
             image_feats,
@@ -215,6 +239,8 @@ class Evaluation:
         num_text,
     ):
         self.device = next(self.model.parameters()).device
+        k_i2t = min(int(self.config["k_test"]), num_text)
+        k_t2i = min(int(self.config["k_test"]), num_image)
 
         metric_logger = utils.MetricLogger(delimiter="  ")
         header = "Evaluation Direction Similarity With Bert Attack:"
@@ -224,10 +250,10 @@ class Evaluation:
 
         with torch.no_grad():
             for i, sims in enumerate(metric_logger.log_every(sims_matrix, 50, header)):
-                topk_sim, topk_idx = sims.topk(k=config["k_test"], dim=0)
+                topk_sim, topk_idx = sims.topk(k=k_i2t, dim=0)
 
                 encoder_output = (
-                    image_embeds[i].repeat(config["k_test"], 1, 1).to(self.device)
+                    image_embeds[i].repeat(k_i2t, 1, 1).to(self.device)
                 )
                 encoder_att = torch.ones(
                     encoder_output.size()[:-1], dtype=torch.long
@@ -247,17 +273,17 @@ class Evaluation:
             score_matrix_t2i = torch.full((num_text, num_image), -100.0).to(self.device)
 
             for i, sims in enumerate(metric_logger.log_every(sims_matrix, 50, header)):
-                topk_sim, topk_idx = sims.topk(k=config["k_test"], dim=0)
+                topk_sim, topk_idx = sims.topk(k=k_t2i, dim=0)
                 encoder_output = image_embeds[topk_idx].to(self.device)
                 encoder_att = torch.ones(
                     encoder_output.size()[:-1], dtype=torch.long
                 ).to(self.device)
                 output = self.model.text_encoder(
                     encoder_embeds=text_embeds[i]
-                    .repeat(config["k_test"], 1, 1)
+                    .repeat(k_t2i, 1, 1)
                     .to(self.device),
                     attention_mask=text_atts[i]
-                    .repeat(config["k_test"], 1)
+                    .repeat(k_t2i, 1)
                     .to(self.device),
                     encoder_hidden_states=encoder_output,
                     encoder_attention_mask=encoder_att,
@@ -337,14 +363,18 @@ def main(args, config):
         config["test_file"], test_transform, config["image_root"], args
     )
 
+    drop_last = args.dataset == "flickr"
     test_loader = DataLoader(
-        test_dataset, batch_size=config["batch_size_test"], num_workers=0
+        test_dataset,
+        batch_size=config["batch_size_test"],
+        num_workers=0,
+        drop_last=drop_last,
     )
 
     tokenizer = BertTokenizer.from_pretrained(args.text_encoder)
 
     model_handler = Model(config, args.text_encoder, tokenizer)
-    model_handler.load_checkpoint(args.checkpoint)
+    model_handler.load_checkpoint(args.checkpoint, victim=getattr(args, "model", "albef"))
     model_handler.to_device(device)
 
     eval_handler = Evaluation(
@@ -363,8 +393,24 @@ def main(args, config):
     result["avg_sim"] = avg_sim
     print(result)
 
+    dump_path = getattr(args, "dump_metrics", "") or ""
+    if dump_path:
+        dump_file = Path(dump_path)
+        dump_file.parent.mkdir(parents=True, exist_ok=True)
+        dump_file.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    if getattr(args, "clean_eval", False):
+        return
+
+    subset = getattr(args, "subset", "") or ""
+    model = getattr(args, "model", "albef") or "albef"
+    metrics = utils.format_result_metrics(
+        "vlr", result, subset=subset, model=model
+    )
     log_stats = {
-        **{f"test_{k}": v for k, v in result.items()},
+        **metrics,
         "text_method": args.text_method,
         "sim_threshold": args.sim_threshold,
         "eval type": args.adv,
@@ -379,17 +425,29 @@ def main(args, config):
         "mode": getattr(args, "mode", "nearest"),
     }
     print(log_stats)
-    with open(os.path.join(args.output_dir, args.log_name), "a+") as f:
-        f.write(json.dumps(log_stats) + "\n")
+    with open(os.path.join(args.output_dir, args.log_name), "w", encoding="utf-8") as f:
+        json.dump(log_stats, f, ensure_ascii=False, indent=2)
+
+    if getattr(args, "run_log", ""):
+        utils.write_attack_run_log(
+            args.run_log,
+            args,
+            config,
+            "vlr",
+            result,
+            dataset_meta={
+                "num_images": len(test_dataset.ann),
+                "num_texts": len(test_dataset.text),
+            },
+        )
 
 
 if __name__ == "__main__":
-    print(1)
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="flickr")
-    parser.add_argument("--config", default="./configs/Retrieval_flickr.yaml")
-    parser.add_argument("--output_dir", default="./output/retrieval/flickr")
-    parser.add_argument("--checkpoint", default="./checkpoints/ALBEF/flickr30k.pth")
+    parser.add_argument("--config", default="./tmm_scc/configs/Retrieval_flickr.yaml")
+    parser.add_argument("--output_dir", default="./outputs/whitebox/vlr/albef/tmm/main_1k")
+    parser.add_argument("--checkpoint", default="./checkpoints/vlr/albef_retrieval_flickr.pth")
     parser.add_argument("--text_encoder", default="bert-base-uncased")
     parser.add_argument("--gpu", type=int, nargs="+", default=[0])
     parser.add_argument("--seed", default=42, type=int)
@@ -412,7 +470,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_json_name", default="")
     parser.add_argument("--config_name", default="")
     parser.add_argument("--save_dir", default="")
+    parser.add_argument("--run_log", default="./outputs/run.json")
+    parser.add_argument("--subset", default="")
+    parser.add_argument("--model", default="albef")
     parser.add_argument("--att_mask", default=0.1, type=float)
+    parser.add_argument("--clean_eval", action="store_true")
+    parser.add_argument("--dump_metrics", default="")
 
     parser.add_argument(
         "--text_method",

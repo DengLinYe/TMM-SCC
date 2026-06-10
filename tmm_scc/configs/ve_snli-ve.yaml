@@ -12,7 +12,7 @@ batch_size_train: 8
 batch_size_test: 8
 
 epsilon: 12
-num_iters: 5
+num_iters: 10
 alpha: 0.4
 
 distill: false

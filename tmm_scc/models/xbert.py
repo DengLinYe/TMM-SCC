@@ -53,15 +53,31 @@ from transformers.utils import logging
 try:
     from transformers.pytorch_utils import apply_chunking_to_forward
 except ImportError:
+    try:
+        from transformers.modeling_utils import apply_chunking_to_forward
+    except ImportError:
 
-    def apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
-        return forward_fn(*input_tensors)
+        def apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
+            return forward_fn(*input_tensors)
 
-    def find_pruneable_heads_and_indices(*args, **kwargs):
-        return set(), []
+try:
+    from transformers.pytorch_utils import (
+        find_pruneable_heads_and_indices,
+        prune_linear_layer,
+    )
+except ImportError:
+    try:
+        from transformers.modeling_utils import (
+            find_pruneable_heads_and_indices,
+            prune_linear_layer,
+        )
+    except ImportError:
 
-    def prune_linear_layer(*args, **kwargs):
-        return args[0]
+        def find_pruneable_heads_and_indices(*args, **kwargs):
+            return set(), []
+
+        def prune_linear_layer(*args, **kwargs):
+            return args[0]
 
 
 transformers.logging.set_verbosity_error()
@@ -582,11 +598,7 @@ class BertLayer(nn.Module):
         outputs = self_attention_outputs[1:-1]
         present_key_value = self_attention_outputs[-1]
 
-        if self.has_cross_attention:
-            assert encoder_hidden_states is not None, (
-                "encoder_hidden_states must be given for cross-attention layers"
-            )
-
+        if self.has_cross_attention and encoder_hidden_states is not None:
             if type(encoder_hidden_states) == list:
                 cross_attention_outputs = self.crossattention(
                     attention_output,
@@ -669,7 +681,12 @@ class BertEncoder(nn.Module):
 
         if mode == "text":
             start_layer = 0
-            output_layer = self.config.fusion_layer
+            # fusion_layer=0：BLIP 全层带 cross-attn，text 阶段仍须跑满 12 层 self-attn
+            output_layer = (
+                self.config.num_hidden_layers
+                if self.config.fusion_layer == 0
+                else self.config.fusion_layer
+            )
 
         elif mode == "fusion":
             start_layer = self.config.fusion_layer

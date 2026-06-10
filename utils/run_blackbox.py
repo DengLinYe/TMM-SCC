@@ -1,24 +1,27 @@
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
+from .clean_eval import ensure_blackbox_victim_clean_metrics
 from .config import (
-    CLIP_HF_ID,
-    HF_VLR_MODELS,
+    BLACKBOX_TARGETS,
     METHOD_LABELS,
+    RunProfile,
+    attack_config_for,
     blackbox_log_path,
+    flickr_image_root_for_task,
     is_hf_model,
     output_dir,
     rel_path,
     resolve_checkpoint,
+    resolve_clip_checkpoint,
+    resolve_whitebox_methods,
+    subset_annotation_path,
 )
+from .log import cmdline, finish_fail, finish_ok, run_subprocess, skip, step
 from .runtime import tmm_scc_env
 
-DEFAULT_TARGETS = {
-    "vlr": ["tcl", "clip"],
-    "ve": ["tcl"],
-}
+DEFAULT_TARGETS = BLACKBOX_TARGETS
 
 
 def manifest_path(task: str, model: str, method: str, subset: str) -> Path:
@@ -33,10 +36,10 @@ def adv_samples_dir(task: str, model: str, method: str, subset: str) -> Path:
     return out / sub
 
 
-def build_blackbox_jobs(tasks, methods, targets, subset):
+def build_blackbox_jobs(tasks, method_sel, targets, subset):
     jobs = []
     for task in tasks:
-        for method in methods:
+        for method in resolve_whitebox_methods(task, method_sel):
             for target in targets.get(task, []):
                 jobs.append(
                     {
@@ -52,7 +55,7 @@ def build_blackbox_jobs(tasks, methods, targets, subset):
 
 def checkpoint_arg(task: str, target: str) -> str:
     if is_hf_model(task, target):
-        return f"hf:{HF_VLR_MODELS[target]}"
+        return resolve_clip_checkpoint()
     ckpt = resolve_checkpoint(task, target)
     if ckpt is None:
         return ""
@@ -64,15 +67,22 @@ def run_blackbox_eval(job: dict, dry_run: bool = False, gpu: int = 0) -> int:
     adv_dir = adv_samples_dir(job["task"], job["surrogate"], job["method"], job["subset"])
 
     if not manifest.exists():
-        print(f"[!] 跳过: manifest 不存在 {manifest}")
-        return 1
+        skip(f"manifest 不存在，跳过 {manifest}", module="blackbox")
+        return 0
 
     ckpt = checkpoint_arg(job["task"], job["target"])
     if not is_hf_model(job["task"], job["target"]):
         path = resolve_checkpoint(job["task"], job["target"])
         if path is None or not path.exists():
-            print(f"[!] 跳过: checkpoint 不存在 {path}")
-            return 1
+            skip(f"checkpoint 不存在，跳过 {path}", module="blackbox")
+            return 0
+
+    ann = subset_annotation_path(job["task"], job["subset"])
+    if not ann.is_file():
+        skip(f"子集标注不存在 {ann}", module="blackbox")
+        return 0
+
+    img_root = flickr_image_root_for_task(job["task"])
 
     cmd = [
         sys.executable,
@@ -87,6 +97,10 @@ def run_blackbox_eval(job: dict, dry_run: bool = False, gpu: int = 0) -> int:
         rel_path(manifest),
         "--adv-image-root",
         rel_path(adv_dir),
+        "--annotation",
+        rel_path(ann),
+        "--image-root",
+        rel_path(img_root),
         "--checkpoint",
         ckpt,
         "--subset",
@@ -98,45 +112,69 @@ def run_blackbox_eval(job: dict, dry_run: bool = False, gpu: int = 0) -> int:
     ]
 
     label = METHOD_LABELS.get(job["method"], job["method"])
-    print(f"\n[▶] 黑盒: {job['task']} | {label} -> {job['target']}")
+    step(f"黑盒: {job['task']} | {label} -> {job['target']}", module="blackbox")
     if dry_run:
-        print(" ".join(cmd))
+        cmdline(cmd)
         return 0
 
-    return subprocess.run(
-        cmd, env=tmm_scc_env(), cwd=str(Path(__file__).resolve().parent.parent)
-    ).returncode
+    return run_subprocess(
+        cmd,
+        cwd=Path(__file__).resolve().parent.parent,
+        env=tmm_scc_env(),
+        module="blackbox",
+        label=f"黑盒 {job['task']} {job['method']}->{job['target']}",
+    )
 
 
-def main(argv=None):
+def main(argv=None, profile: RunProfile = None):
     parser = argparse.ArgumentParser(description="黑盒迁移攻击评测")
     parser.add_argument("--task", choices=["vlr", "ve", "all"], default="all")
-    parser.add_argument("--method", choices=["tmm", "scc", "all"], default="all")
+    parser.add_argument("--method", choices=["tmm", "scc", "coattack", "sga", "all"], default="all")
     parser.add_argument("--target", nargs="+", default=None)
     parser.add_argument("--subset", default="main_1k")
-    parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
-    tasks = ["vlr", "ve"] if args.task == "all" else [args.task]
-    methods = ["tmm", "scc"] if args.method == "all" else [args.method]
-    targets = DEFAULT_TARGETS.copy()
+    gpu = profile.gpu if profile is not None else args.gpu
+    dry_run = (profile.dry_run if profile is not None else False) or args.dry_run
+    subset = profile.subset if profile is not None else args.subset
+    task_sel = profile.blackbox_task if profile is not None else args.task
+    method_sel = profile.blackbox_method if profile is not None else args.method
+
+    tasks = ["vlr", "ve"] if task_sel == "all" else [task_sel]
+    targets = {k: list(v) for k, v in DEFAULT_TARGETS.items()}
+    if profile and profile.blackbox_targets:
+        for k, v in profile.blackbox_targets.items():
+            targets[k] = list(v)
     if args.target:
         for t in tasks:
             targets[t] = args.target
 
+    attack = attack_config_for(profile, gpu=gpu) if profile else attack_config_for(gpu=gpu)
+
+    rc = ensure_blackbox_victim_clean_metrics(
+        tasks,
+        targets,
+        subset,
+        attack,
+        dry_run=dry_run,
+        force=bool(profile and profile.force_finetune),
+    )
+    if rc != 0 and not dry_run:
+        finish_fail(1, label="受害模型 clean 基准", module="blackbox")
+        return rc
+
     blackbox_log_path().parent.mkdir(parents=True, exist_ok=True)
-    jobs = build_blackbox_jobs(tasks, methods, targets, args.subset)
+    jobs = build_blackbox_jobs(tasks, method_sel, targets, subset)
     for job in jobs:
-        job["gpu"] = args.gpu
+        job["gpu"] = gpu
 
     failed = 0
     for job in jobs:
-        if run_blackbox_eval(job, dry_run=args.dry_run, gpu=args.gpu) != 0:
+        if run_blackbox_eval(job, dry_run=dry_run, gpu=gpu) != 0:
             failed += 1
 
     if failed:
-        print(f"\n[!] 黑盒评测完成，{failed} 个任务失败")
-        sys.exit(1)
-    print("\n[+] 黑盒评测全部完成")
+        finish_fail(failed, label="黑盒评测", module="blackbox")
+    finish_ok("黑盒评测全部完成", module="blackbox")

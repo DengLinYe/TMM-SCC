@@ -8,6 +8,7 @@ import datetime
 import torch
 import torch.distributed as dist
 import json
+from pathlib import Path
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -278,3 +279,116 @@ def read_json(rpath):
     except json.JSONDecodeError:
         print(f"Error parsing JSON file {rpath}.")
         return None
+
+
+import run_log
+
+
+def _clean_metrics_path(task):
+    return Path(__file__).resolve().parent.parent / "checkpoints" / task / "clean_metrics.json"
+
+
+def load_clean_raw(task, subset, model):
+    path = _clean_metrics_path(task)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    record = data.get(subset or "", {}).get(model or "albef")
+    return record if isinstance(record, dict) else None
+
+
+def append_run_log(log_path, record):
+    if not log_path:
+        return
+
+    run_log.append_run_log(record, Path(log_path))
+
+
+def format_result_metrics(task, raw_result, subset="", model="albef"):
+    clean = load_clean_raw(task, subset, model)
+    if task == "vlr":
+        return run_log.vlr_results(raw_result, clean=clean)
+    clean_acc = clean.get("accuracy") if clean else None
+    return run_log.ve_results(
+        raw_result["accuracy"], raw_result.get("avg_sim", 0.0), clean_accuracy=clean_acc
+    )
+
+
+def write_attack_run_log(log_path, args, config, task, raw_result, dataset_meta=None):
+    subset = getattr(args, "subset", "") or ""
+    model = getattr(args, "model", "albef") or "albef"
+    method = getattr(args, "text_method", "tmm")
+    experiment = f"whitebox_{task}_{model}_{method}"
+
+    cfg = run_log.attack_config_block(args, config, task)
+    if subset:
+        meta = dataset_meta or {}
+        cfg.update(
+            run_log.subset_dataset_counts(
+                subset,
+                task,
+                num_images=meta.get("num_images"),
+                num_texts=meta.get("num_texts"),
+                num_samples=meta.get("num_samples"),
+            )
+        )
+
+    clean = load_clean_raw(task, subset, model)
+    if task == "vlr":
+        results = run_log.vlr_results(raw_result, clean=clean)
+    else:
+        clean_acc = clean.get("accuracy") if clean else None
+        results = run_log.ve_results(
+            raw_result["accuracy"],
+            raw_result.get("avg_sim", 0.0),
+            clean_accuracy=clean_acc,
+        )
+
+    append_run_log(log_path, run_log.build_experiment_record(experiment, cfg, results))
+
+
+def write_blackbox_run_log(log_path, args, raw_result):
+    experiment = f"blackbox_{args.task}_{args.method}_{args.target}"
+    cfg = {
+        "task": args.task,
+        "method": args.method,
+        "target": args.target,
+        "subset": args.subset,
+        "manifest": args.manifest,
+        "adv_image_root": args.adv_image_root,
+        "checkpoint": args.checkpoint or "",
+    }
+    try:
+        with open(args.manifest, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        if args.task == "vlr":
+            img_ids = {
+                str(r.get("image_id", r.get("text_id", i)))
+                for i, r in enumerate(manifest)
+            }
+            cfg.update(
+                run_log.subset_dataset_counts(
+                    args.subset,
+                    args.task,
+                    num_images=len(img_ids),
+                    num_texts=len(manifest),
+                )
+            )
+        else:
+            cfg.update(
+                run_log.subset_dataset_counts(
+                    args.subset, args.task, num_samples=len(manifest)
+                )
+            )
+    except (OSError, json.JSONDecodeError):
+        pass
+    clean = load_clean_raw(args.task, args.subset, args.target)
+    if args.task == "vlr":
+        results = run_log.vlr_results({**raw_result, "avg_sim": 0.0}, clean=clean)
+    else:
+        clean_acc = clean.get("accuracy") if clean else None
+        results = run_log.ve_results(raw_result["accuracy"], clean_accuracy=clean_acc)
+    append_run_log(log_path, run_log.build_experiment_record(experiment, cfg, results))

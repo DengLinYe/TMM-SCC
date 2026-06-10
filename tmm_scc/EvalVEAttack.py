@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 import argparse
 import datetime
 import json
@@ -62,10 +66,11 @@ class EvaluationVE:
         self.model.eval()
         self.ref_model.eval()
 
-        print("Computing features for VE evaluation adv...")
+        clean_mode = args.adv == 0 or getattr(args, "clean_eval", False)
+        label = "clean" if clean_mode else "adv"
+        print(f"Computing features for VE evaluation ({label})...")
         start_time = time.time()
 
-        sim_model = SentenceTransformer("all-MiniLM-L6-v2").to(self.device)
         total_sim = 0.0
         sim_count = 0
 
@@ -73,44 +78,49 @@ class EvaluationVE:
             (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
         )
 
-        device = next(self.model.parameters()).device
-        if args.text_method == "tmm":
-            from attack.textAttack import TextAttacker
+        multi_attacker = None
+        sim_model = None
+        if not clean_mode:
+            sim_model = SentenceTransformer("all-MiniLM-L6-v2").to(self.device)
+            device = next(self.model.parameters()).device
+            if args.text_method == "tmm":
+                from attack.textAttack import TextAttacker
 
-            print(">>> 加载原版 TMM 文本攻击器...")
-            text_attacker = TextAttacker(
-                self.ref_model,
-                self.tokenizer,
-                device,
-                cls=args.cls,
-            )
-        elif args.text_method == "scc":
-            from attack.textAttackSCC import TextAttackerSCC
+                print(">>> 加载原版 TMM 文本攻击器...")
+                text_attacker = TextAttacker(
+                    self.ref_model,
+                    self.tokenizer,
+                    device,
+                    cls=args.cls,
+                )
+            elif args.text_method == "scc":
+                from attack.textAttackSCC import TextAttackerSCC
 
-            print(f">>> 加载 TMM-SCC 文本攻击器 (阈值: {args.sim_threshold})...")
-            text_attacker = TextAttackerSCC(
+                print(f">>> 加载 TMM-SCC 文本攻击器 (阈值: {args.sim_threshold})...")
+                text_attacker = TextAttackerSCC(
+                    tokenizer=self.tokenizer,
+                    device=device,
+                    cls=args.cls,
+                    sim_threshold=args.sim_threshold,
+                )
+            else:
+                raise ValueError(f"不支持的文本攻击方法: {args.text_method}")
+
+            multi_attacker = MultiModalAttacker(
+                net=self.model,
+                text_attacker=text_attacker,
                 tokenizer=self.tokenizer,
-                device=device,
+                args=args,
                 cls=args.cls,
-                sim_threshold=args.sim_threshold,
             )
-        else:
-            raise ValueError(f"不支持的文本攻击方法: {args.text_method}")
-
-        multi_attacker = MultiModalAttacker(
-            net=self.model,
-            text_attacker=text_attacker,
-            tokenizer=self.tokenizer,
-            args=args,
-            cls=args.cls,
-        )
 
         correct = 0
         total = 0
 
         adv_save_dir = os.path.join(args.save_dir, "adv_samples_ve")
-        os.makedirs(adv_save_dir, exist_ok=True)
         adv_records = []
+        if not clean_mode:
+            os.makedirs(adv_save_dir, exist_ok=True)
 
         import torchvision
 
@@ -118,43 +128,39 @@ class EvaluationVE:
         for step, (images, texts, labels) in enumerate(
             tqdm(self.data_loader, ascii=True)
         ):
-            # if step >= 20:
-            #     print("\n>>> 快速验证：已完成 20 个 Batch，提前结束攻击循环 <<<")
-            #     torch.cuda.empty_cache()
-            #     break
-
             images = images.to(self.device)
             labels = labels.to(self.device)
             orig_texts = list(texts)
 
-            if args.adv != 0:
+            if args.adv != 0 and multi_attacker is not None:
                 images, texts = multi_attacker.run_transfer_attack(
                     images, texts, args, num_iters=self.config["num_iters"]
                 )
 
-            orig_embs = sim_model.encode(orig_texts, convert_to_tensor=True)
-            adv_embs = sim_model.encode(texts, convert_to_tensor=True)
-            batch_sims = F.cosine_similarity(orig_embs, adv_embs)
+            if not clean_mode:
+                orig_embs = sim_model.encode(orig_texts, convert_to_tensor=True)
+                adv_embs = sim_model.encode(texts, convert_to_tensor=True)
+                batch_sims = F.cosine_similarity(orig_embs, adv_embs)
 
-            total_sim += batch_sims.sum().item()
-            sim_count += len(texts)
+                total_sim += batch_sims.sum().item()
+                sim_count += len(texts)
 
-            for i in range(images.size(0)):
-                global_idx = step * self.config["batch_size_test"] + i
-                img_filename = f"adv_{global_idx}.png"
-                img_path = os.path.join(adv_save_dir, img_filename)
-                torchvision.utils.save_image(images[i], img_path)
+                for i in range(images.size(0)):
+                    global_idx = step * self.config["batch_size_test"] + i
+                    img_filename = f"adv_{global_idx}.png"
+                    img_path = os.path.join(adv_save_dir, img_filename)
+                    torchvision.utils.save_image(images[i], img_path)
 
-                adv_records.append(
-                    {
-                        "image_id": global_idx,
-                        "image_path": img_filename,
-                        "orig_text": orig_texts[i],
-                        "adv_text": texts[i],
-                        "label": labels[i].item(),
-                        "sim_score": round(batch_sims[i].item(), 4),
-                    }
-                )
+                    adv_records.append(
+                        {
+                            "image_id": global_idx,
+                            "image_path": img_filename,
+                            "orig_text": orig_texts[i],
+                            "adv_text": texts[i],
+                            "label": labels[i].item(),
+                            "sim_score": round(batch_sims[i].item(), 4),
+                        }
+                    )
 
             texts_input = self.tokenizer(
                 texts,
@@ -176,16 +182,18 @@ class EvaluationVE:
 
             torch.cuda.empty_cache()
 
-        with open(
-            os.path.join(args.save_dir, "ve_adv_manifest.json"), "w", encoding="utf-8"
-        ) as f:
-            json.dump(adv_records, f, indent=4, ensure_ascii=False)
+        if not clean_mode:
+            with open(
+                os.path.join(args.save_dir, "ve_adv_manifest.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump(adv_records, f, indent=4, ensure_ascii=False)
 
         accuracy = 100.0 * correct / total
         avg_sim = total_sim / sim_count if sim_count > 0 else 0.0
 
         print(f"VE Task Accuracy after Attack: {accuracy:.2f}%")
-        print(f"Average Semantic Similarity: {avg_sim:.4f}")
+        if not clean_mode:
+            print(f"Average Semantic Similarity: {avg_sim:.4f}")
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -240,8 +248,22 @@ def main(args, config):
     result = eval_handler.ve_eval(args)
     print(result)
 
+    dump_path = getattr(args, "dump_metrics", "") or ""
+    if dump_path:
+        dump_file = Path(dump_path)
+        dump_file.parent.mkdir(parents=True, exist_ok=True)
+        dump_file.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    if getattr(args, "clean_eval", False):
+        return
+
+    subset = getattr(args, "subset", "") or ""
+    model = getattr(args, "model", "albef") or "albef"
+    metrics = utils.format_result_metrics("ve", result, subset=subset, model=model)
     log_stats = {
-        **{f"test_{k}": v for k, v in result.items()},
+        **metrics,
         "text_method": args.text_method,
         "sim_threshold": args.sim_threshold,
         "eval type": args.adv,
@@ -256,16 +278,26 @@ def main(args, config):
         "mode": getattr(args, "mode", "nearest"),
     }
     print(log_stats)
-    with open(os.path.join(args.output_dir, args.log_name), "a+") as f:
-        f.write(json.dumps(log_stats) + "\n")
+    with open(os.path.join(args.output_dir, args.log_name), "w", encoding="utf-8") as f:
+        json.dump(log_stats, f, ensure_ascii=False, indent=2)
+
+    if getattr(args, "run_log", ""):
+        utils.write_attack_run_log(
+            args.run_log,
+            args,
+            config,
+            "ve",
+            result,
+            dataset_meta={"num_samples": len(test_dataset)},
+        )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="snli-ve")
-    parser.add_argument("--config", default="./configs/ve_snli-ve.yaml")
-    parser.add_argument("--output_dir", default="./output/ve/snli-ve")
-    parser.add_argument("--checkpoint", default="./checkpoints/ALBEF/ve.pth")
+    parser.add_argument("--config", default="./tmm_scc/configs/ve_snli-ve.yaml")
+    parser.add_argument("--output_dir", default="./outputs/whitebox/ve/albef/tmm/main_1k")
+    parser.add_argument("--checkpoint", default="./checkpoints/ve/albef_ve_snli_ve.pth")
     parser.add_argument("--text_encoder", default="bert-base-uncased")
     parser.add_argument("--gpu", type=int, nargs="+", default=[0])
     parser.add_argument("--seed", default=42, type=int)
@@ -282,7 +314,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_json_name", default="")
     parser.add_argument("--config_name", default="config.yaml")
     parser.add_argument("--save_dir", default="")
+    parser.add_argument("--run_log", default="./outputs/run.json")
+    parser.add_argument("--subset", default="")
+    parser.add_argument("--model", default="albef")
     parser.add_argument("--att_mask", default=0.1, type=float)
+    parser.add_argument("--clean_eval", action="store_true")
+    parser.add_argument("--dump_metrics", default="")
 
     parser.add_argument(
         "--text_method",

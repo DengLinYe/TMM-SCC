@@ -6,57 +6,67 @@
 pip install -r requirements.txt
 ```
 
-## 统一入口
+## 入口
 
 ```bash
-python main.py                 # 交互控制台
-python main.py --quick         # 快速验证（等同菜单 0，--smoke 同义）
-python main.py --full          # 正式流水线
+python main.py
 ```
 
-## 交互菜单
+GPU 编号：`utils/config.py` → `GPU`。
+
+## 实验逻辑（学界规范对齐）
+
+| 阶段 | 内容 |
+|------|------|
+| **白盒攻击** | 在 ALBEF surrogate 上生成 adv 样本（VLR/VE × TMM/SCC/Co-Attack/SGA） |
+| **黑盒迁移** | 将 manifest 中的 adv 样本迁移评测受害模型 TCL / BLIP / CLIP |
+| **ASR** | `(clean_accuracy - adv_accuracy) / clean_accuracy × 100`，clean 来自 `checkpoints/{task}/clean_metrics.json`（按需计算、缓存） |
+| **VE 微调** | VLR 权重 warm-start → SNLI-VE，产出 VE 黑盒 victim 权重 |
+| **消融** | 仅 VE 上 TMM vs SCC 的 `num_iters` 曲线（`ablation_200` 子集） |
+
+默认攻击迭代 **`num_iters = 10`**（`AttackConfig`；测试 profile 仍用 2 以加快 smoke）。
+
+## 控制台菜单
 
 | 选项 | 功能 |
 |------|------|
-| **0** | **快速验证全流程**（见下表，与 `--quick` 相同） |
-| 1 | 生成数据子集 |
-| 2 | 白盒攻击 |
-| 3 | 黑盒评测 |
-| 4 | num_iters 消融 |
-| 5 | VE 微调 |
-| 6 | 正式实验 (main_1k) |
-| q | 退出 |
+| **1–5** | 分步：子集 / 白盒 / 黑盒 / 消融 / 微调 |
+| **6** | 本地测试全流程 `mini_100`（含微调+消融，`iters=2`） |
+| **7** | 本地正式全流程 `main_1k`（无消融，`iters=10`） |
+| **8** | 强制测试（同 6，强制重跑 VE 微调） |
+| **9** | **云端·测试全流程** `mini_100` |
+| **10** | **云端·消融** `ablation_200`（含 prepare）→ 据此修改正式 `num_iters` |
+| **11** | **云端·正式全流程** `main_1k`（清 outputs 除 run.json） |
+| **12** | **云端·正式(无微调)** 复用已有 `checkpoints/ve` |
+| **q** | 退出 |
 
-## 快速验证配置
+### 推荐云端顺序
 
-与正式实验**步骤一致**，仅缩小规模：
-
-| 项目 | 快速验证 | 正式实验 |
-|------|----------|----------|
-| 子集 | smoke_20（20 图 + 20 条 VE） | main_1k |
-| num_iters | 2 | 5（config 默认） |
-| 微调 epochs | 2（ALBEF + TCL） | 3 |
-| 攻击方法 | TMM + SCC | TMM + SCC |
-| 黑盒受害 | TCL + CLIP | TCL + CLIP |
-| 消融 iters | 2, 3 | 3, 5, 10, 20 |
-
-**执行顺序：** prepare → finetune(albef,tcl) → attack → ablation → blackbox
-
-```bash
-python main.py --quick --gpu 0
-python main.py --quick --dry-run
 ```
+9 测试全流程 → 10 消融 → （改 config 中 attack_num_iters）→ 11 正式全流程
+```
+
+- **11 / 12** 启动时 `clean_for_cloud_main()`：删除 `mini_100` / `main_1k` 攻击产物与 `finetune/` 等，**保留 `run.json` 与 `ablation_200` 消融目录**。
+
+## 24G 显存预设（`HARDWARE_PRESETS.server_24g`）
+
+| 参数 | 值 |
+|------|-----|
+| `batch_size_vlr` | 10 |
+| `batch_size_ve` | 16 |
+| `sga_batch_size_vlr` | 10 |
+
+云端 profile 已内置上述值；本地 8G 用 `local_8g`。
 
 ## 目录
 
 ```
-main.py          # 唯一入口
-utils/           # 实验逻辑
-tmm_scc/         # 攻击核心
-third_party/     # ALBEF/TCL 微调
-data/            # 数据
-checkpoints/     # 权重
-outputs/         # 输出
+main.py          # 入口
+utils/config.py  # 全部默认参数与 RunProfile
+tmm_scc/         # 攻击与黑盒评测
+checkpoints/     # 权重 + clean_metrics.json
+outputs/         # 攻击产物 + run.json
+data/            # 子集与全量标注
 ```
 
-CLIP 黑盒从 HuggingFace 加载 `openai/clip-vit-base-patch16`，无需本地权重。
+CLIP 权重缓存：`checkpoints/vlr/clip/`（离线 HuggingFace）。

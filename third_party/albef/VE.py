@@ -25,6 +25,15 @@ os.environ["HTTP_PROXY"] = ""
 os.environ["HTTPS_PROXY"] = ""
 
 
+def load_checkpoint_state_dict(checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        return checkpoint["model"]
+    if isinstance(checkpoint, dict):
+        return checkpoint
+    raise ValueError(f"无法识别 checkpoint 格式: {checkpoint_path}")
+
+
 def train(
     model,
     data_loader,
@@ -60,7 +69,9 @@ def train(
             targets.to(device, non_blocking=True),
         )
 
-        text_inputs = tokenizer(text, padding="longest", return_tensors="pt").to(device)
+        text_inputs = tokenizer(
+            text, padding="longest", truncation=True, max_length=30, return_tensors="pt"
+        ).to(device)
 
         if epoch > 0 or not config["warm_up"]:
             alpha = config["alpha"]
@@ -106,7 +117,9 @@ def evaluate(model, data_loader, tokenizer, device, config):
             targets.to(device, non_blocking=True),
         )
 
-        text_inputs = tokenizer(text, padding="longest", return_tensors="pt").to(device)
+        text_inputs = tokenizer(
+            text, padding="longest", truncation=True, max_length=30, return_tensors="pt"
+        ).to(device)
 
         prediction = model(images, text_inputs, targets=targets, train=False)
 
@@ -149,11 +162,12 @@ def main(args, config):
     else:
         samplers = [None, None, None]
 
+    num_workers = config.get("num_workers", 4)
     train_loader, val_loader, test_loader = create_loader(
         datasets,
         samplers,
         batch_size=[config["batch_size_train"]] + [config["batch_size_test"]] * 2,
-        num_workers=[4, 4, 4],
+        num_workers=[num_workers, num_workers, num_workers],
         is_trains=[True, False, False],
         collate_fns=[None, None, None],
     )
@@ -165,17 +179,16 @@ def main(args, config):
     model = ALBEF(config=config, text_encoder=args.text_encoder, tokenizer=tokenizer)
 
     if args.checkpoint:
-        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        state_dict = checkpoint["model"]
+        state_dict = load_checkpoint_state_dict(args.checkpoint)
 
-        # reshape positional embedding to accomodate for image resolution change
-        pos_embed_reshaped = interpolate_pos_embed(
-            state_dict["visual_encoder.pos_embed"], model.visual_encoder
-        )
-        state_dict["visual_encoder.pos_embed"] = pos_embed_reshaped
+        if "visual_encoder.pos_embed" in state_dict:
+            pos_embed_reshaped = interpolate_pos_embed(
+                state_dict["visual_encoder.pos_embed"], model.visual_encoder
+            )
+            state_dict["visual_encoder.pos_embed"] = pos_embed_reshaped
 
         if not args.evaluate:
-            if config["distill"]:
+            if config["distill"] and "visual_encoder_m.pos_embed" in state_dict:
                 m_pos_embed_reshaped = interpolate_pos_embed(
                     state_dict["visual_encoder_m.pos_embed"], model.visual_encoder_m
                 )
