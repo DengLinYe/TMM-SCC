@@ -9,6 +9,7 @@ __pycache__/
 !requirements.txt
 baseline_results.json
 .cursorignore
+/yum/
 
 third_party/*/output/
 third_party/*/checkpoints/
